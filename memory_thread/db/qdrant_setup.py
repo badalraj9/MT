@@ -20,6 +20,10 @@ def setup_qdrant_collection(client: qdrant_client.QdrantClient):
             vectors_config=models.VectorParams(
                 size=EMBEDDING_SIZE,
                 distance=DISTANCE
+            ),
+            hnsw_config=models.HnswConfigDiff(
+                m=64,
+                ef_construct=200
             )
         )
 

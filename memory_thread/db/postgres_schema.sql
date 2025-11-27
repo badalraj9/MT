@@ -37,3 +37,7 @@ CREATE TABLE IF NOT EXISTS memory_edges (
     weight FLOAT,
     last_activated TIMESTAMP
 );
+
+-- EXTENSIONS & INDEXES -----------------------------------------
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX IF NOT EXISTS memories_content_trgm_idx ON memories USING gin (content gin_trgm_ops);

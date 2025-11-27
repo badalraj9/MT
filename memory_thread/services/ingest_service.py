@@ -51,11 +51,10 @@ def ingest_texts(texts: List[str], importance: float = 0.5, source: str = "user"
     # Qdrant is updated to handle batches
     store_vectors(memory_objects)
 
-    # Postgres is still one-by-one, but can be batched with psycopg2.extras.execute_batch
-    # For now, we loop to keep it simple.
+    # Postgres is still one-by-one for this phase
     for mem in memory_objects:
         store_memory_in_graph(mem)
-        create_graph_edges(mem) # Still a placeholder
+        create_graph_edges(mem) # Placeholder
 
     log.info(f"Successfully processed and stored a batch of {len(memory_objects)} memories.")
     return memory_objects

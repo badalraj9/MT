@@ -57,5 +57,25 @@ def create_graph_edges(memory_object: MemoryObject):
     log.info(f"Placeholder: Creating graph edges for memory ID {memory_object.id}.")
     pass
 
+def keyword_search_memories(query: str, top_k: int = 10) -> List[Dict[str, Any]]:
+    """
+    Performs a keyword search on the 'content' of memories using the trigram index.
+    """
+    # The '%' signs are wildcards for the LIKE query.
+    sql = "SELECT *, similarity(content, %s) AS keyword_score FROM memories ORDER BY keyword_score DESC LIMIT %s"
+    conn = None
+    try:
+        conn = get_postgres_connection()
+        with conn.cursor() as cur:
+            cur.execute(sql, (query, top_k))
+            results = cur.fetchall()
+        return results
+    except Exception as e:
+        log.error(f"Error during keyword search: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
 # Other functions like get_neighbors, get_memories_by_ids would go here
 # For now, this is the critical function to fix consistency.

@@ -25,7 +25,6 @@ def extract_structured_data(text: str) -> dict:
         entities.append(llm_data["entity"])
 
     # Add regex-found items to the entities list if they are not already covered
-    # (e.g., emails and URLs are not typically caught by the default NER model)
     for entity_type, found_items in regex_data.items():
         if entity_type in ['email', 'url']:
              entities.extend(found_items)
