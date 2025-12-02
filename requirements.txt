@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+pydantic-settings
+psycopg2-binary
+qdrant-client
+spacy
+faker
