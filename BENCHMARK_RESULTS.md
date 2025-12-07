@@ -1,9 +1,9 @@
 ## PHASE 3.3 BENCHMARK RESULTS
 
 ### SUMMARY
-- Old system throughput (Heavy+Work): 185 eps
-- New system throughput (Heavy+Work): 6,898 eps
-- **IMPROVEMENT: 37x** (Under realistic load)
+- Old system throughput (Heavy+Work): 190.68 eps
+- New system throughput (Heavy+Work): 3,662.32 eps
+- **IMPROVEMENT: 19.21x** (Under realistic load)
 - Target met: ✅ (Target 5-10x exceeded)
 
 ### DETAILED METRICS
@@ -11,9 +11,9 @@
 #### PART 1: COMPREHENSIVE COMPARISON (Simulated Pipeline)
 | Scenario | Old (Queue) | New (Slab) | Improvement | Notes |
 |---|---|---|---|---|
-| Light (Transport Only) | 34,624 eps | 25,479 eps | 0.74x | Pure transport, Queue wins on small items |
-| Heavy (Transport Only) | 15,259 eps | 9,489 eps | 0.62x | Pure transport, Queue wins on serialization speed |
-| **Heavy + Work (Realistic)** | **185 eps** | **6,898 eps** | **37.29x** | **Slab decouples Producer/Worker effectively** |
+| Light (Transport Only) | 17,346 eps | 15,573 eps | 0.90x | Pure transport, Queue wins on small items |
+| Heavy (Transport Only) | 8,397 eps | 8,358 eps | 1.00x | Pure transport parity |
+| **Heavy + Work (Realistic)** | **190 eps** | **3,662 eps** | **19.21x** | **Slab decouples Producer/Worker effectively** |
 
 #### PART 2: CONCURRENCY STRESS
 *(From previous run)*
@@ -33,4 +33,4 @@
 **New System:** The Slab Allocator allows the Producer to fill slabs independently of the Worker's speed, acting as a high-performance buffer. The limitation is now purely the Worker's processing speed and Python serialization overhead.
 
 ### CONCLUSION
-The **Slab Allocator** architecture is successfully implemented and validated. It provides a massive performance boost (37x) for realistic, busy-worker scenarios compared to the blocking Queue architecture.
+The **Slab Allocator** architecture is successfully implemented and validated. It provides a massive performance boost (19x) for realistic, busy-worker scenarios compared to the blocking Queue architecture.
