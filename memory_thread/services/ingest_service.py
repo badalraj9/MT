@@ -1,6 +1,8 @@
 import multiprocessing as mp
 import time
-from typing import List
+import struct
+import json
+from typing import List, Union, Dict
 from memory_thread.utils.shared_memory import SlabAllocator
 from memory_thread.services.hybrid_ner_service import extract_entities
 from memory_thread.utils.embeddings import generate_embeddings
@@ -19,12 +21,32 @@ def worker_process(allocator: SlabAllocator, output_queue: mp.Queue):
         slab = allocator.get_written_slab()
         if slab:
             try:
-                # Assuming the data is a utf-8 encoded string
-                text = slab.memory.tobytes().decode('utf-8').strip('\x00')
-                log.info(f"Worker processing slab {slab.slab_id}: {text}")
+                # Read 4-byte Length Header
+                header = slab.memory[:4].tobytes()
+                msg_len = struct.unpack("!I", header)[0]
+
+                # Read Body
+                raw_data = slab.memory[4:4+msg_len].tobytes()
+
+                # Determine content type (simple heuristic: starts with { is JSON, else String)
+                # Ideally we'd have a type flag in header, but this works for now
+                if raw_data.startswith(b'{'):
+                    try:
+                        content_obj = json.loads(raw_data)
+                        text = content_obj.get("content", "")
+                        # Could pass full object if we support pre-structured input
+                    except json.JSONDecodeError:
+                        text = raw_data.decode('utf-8')
+                else:
+                    text = raw_data.decode('utf-8')
+
+                log.info(f"Worker processing slab {slab.slab_id}: {text[:50]}...")
 
                 # Full processing pipeline
                 now = time.time()
+
+                # In Phase 3.4 (TMS), we will replace this simplistic MemoryObject creation
+                # with an Event -> TMS Pipeline. For now, we maintain existing logic.
                 memory_object = MemoryObject(
                     content=text,
                     memory_type=(classify_memory(text)[0]),
@@ -35,6 +57,9 @@ def worker_process(allocator: SlabAllocator, output_queue: mp.Queue):
                     last_accessed=now,
                     metadata=MemoryMetadata(source="user", negation=classify_memory(text)[1])
                 )
+
+                # Phase 3.4 Optimization: Move embedding to separate process?
+                # For now, keep here as per current architecture.
                 embedding = generate_embeddings((text,))[0]
                 memory_object.embedding = embedding
 
@@ -44,10 +69,10 @@ def worker_process(allocator: SlabAllocator, output_queue: mp.Queue):
                 log.error(f"Error processing slab {slab.slab_id}: {e}")
                 allocator.release_slab(slab.slab_id) # Ensure slab is released on error
         else:
-            time.sleep(0.01) # No work to do, sleep a bit
+            time.sleep(0.001) # Yield CPU
 
 class IngestionService:
-    def __init__(self, num_slabs=128, slab_size=4096):
+    def __init__(self, num_slabs=128, slab_size=65536): # Increased to 64KB for safety
         self.allocator = SlabAllocator(num_slabs=num_slabs, slab_size=slab_size)
         self.output_queue = mp.Queue()
         self.workers = []
@@ -77,35 +102,55 @@ class IngestionService:
                 continue
 
     def start(self):
-        self.db_writer_process.start()
-        for _ in range(mp.cpu_count() - 1):
+        if not self.db_writer_process.is_alive():
+            self.db_writer_process.start()
+
+        # Clear existing workers if any (restart logic)
+        for p in self.workers:
+            if p.is_alive(): p.terminate()
+        self.workers = []
+
+        for _ in range(max(1, mp.cpu_count() - 2)): # Leave 1 for API, 1 for DB Writer
             p = mp.Process(target=worker_process, args=(self.allocator, self.output_queue))
             p.start()
             self.workers.append(p)
         log.info(f"Started {len(self.workers)} worker processes.")
 
-    def ingest_texts(self, texts: List[str]):
+    def ingest_texts(self, texts: List[Union[str, Dict]]):
         import hashlib
-        for text in texts:
-            text_hash = hashlib.sha256(text.encode()).hexdigest()
+        for item in texts:
+            # Handle both strings and dicts (future-proofing for Phase 3.4 events)
+            if isinstance(item, dict):
+                text_content = item.get("content", str(item))
+                encoded_data = json.dumps(item).encode('utf-8')
+            else:
+                text_content = item
+                encoded_data = item.encode('utf-8')
+
+            text_hash = hashlib.sha256(text_content.encode()).hexdigest()
             if text_hash in result_cache:
-                log.info(f"Cache hit for text: {text}")
+                log.info(f"Cache hit for text: {text_content[:30]}...")
                 continue
 
-            encoded_text = text.encode('utf-8')
-            if len(encoded_text) >= self.allocator.slab_size:
-                log.warning(f"Text too large for slab, skipping: {text[:100]}...")
+            msg_len = len(encoded_data)
+            if msg_len + 4 > self.allocator.slab_size:
+                log.warning(f"Data too large for slab ({msg_len} > {self.allocator.slab_size}), skipping.")
                 continue
 
             slab = self.allocator.reserve_slab()
-            slab.memory[:len(encoded_text)] = encoded_text
+            # Write Header (4 bytes)
+            slab.memory[:4] = struct.pack("!I", msg_len)
+            # Write Body
+            slab.memory[4:4+msg_len] = encoded_data
+
             self.allocator.mark_as_written(slab.slab_id)
-            result_cache.set(text_hash, True) # Mark as in-flight/processed
-            log.info(f"Wrote to slab {slab.slab_id}.")
+            result_cache.set(text_hash, True)
+            # log.info(f"Wrote to slab {slab.slab_id}.")
 
     def shutdown(self):
         self.output_queue.put(None)
-        self.db_writer_process.join()
+        if self.db_writer_process.is_alive():
+            self.db_writer_process.join()
         for p in self.workers:
             p.terminate()
             p.join()
