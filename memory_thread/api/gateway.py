@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from typing import List, Dict, Any
 import asyncio
@@ -8,10 +8,10 @@ from memory_thread.utils.logger import get_logger
 
 log = get_logger(__name__)
 
-app = FastAPI(title="Memory Thread Ingestion Gateway")
+router = APIRouter()
 
 # Global State
-router = FabricRouter(address="ipc://ingest_gateway", mode="ROUTER")
+fabric_router = FabricRouter(address="ipc://ingest_gateway", mode="ROUTER")
 pressure_score = 0.0
 producer_registry = {}
 
@@ -24,16 +24,16 @@ class RegisterProducerRequest(BaseModel):
     type: str # 'python', 'rust'
     version: str
 
-@app.on_event("startup")
+@router.on_event("startup")
 async def startup_event():
-    await router.start()
+    await fabric_router.start()
     asyncio.create_task(pressure_monitor_loop())
 
-@app.on_event("shutdown")
+@router.on_event("shutdown")
 def shutdown_event():
-    router.close()
+    fabric_router.close()
 
-@app.post("/register")
+@router.post("/register")
 async def register_producer(req: RegisterProducerRequest):
     producer_registry[req.producer_id] = {
         "type": req.type,
@@ -43,7 +43,7 @@ async def register_producer(req: RegisterProducerRequest):
     log.info(f"Registered Producer: {req.producer_id}")
     return {"status": "ok", "throttle": pressure_score}
 
-@app.post("/ingest")
+@router.post("/ingest")
 async def ingest_batch(req: BatchIngestRequest):
     # Check Pressure
     if pressure_score > 0.9:
@@ -54,7 +54,7 @@ async def ingest_batch(req: BatchIngestRequest):
     # For now, we simulate success
     return {"status": "accepted", "count": len(req.events)}
 
-@app.get("/control/throttle")
+@router.get("/control/throttle")
 async def get_throttle():
     return {"pressure": pressure_score}
 
