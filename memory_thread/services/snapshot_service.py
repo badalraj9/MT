@@ -2,121 +2,106 @@ import uuid
 import json
 import hashlib
 from typing import Dict, Any, Optional, List
-from memory_thread.models.events import EntityState, Event
-from memory_thread.services.tms_service import StateDerivationService
+from datetime import datetime
+
+from memory_thread.models.events import EntityState, TruthVector
+from memory_thread.db.postgres_client import PostgresClient
 from memory_thread.utils.logger import get_logger
 
 log = get_logger(__name__)
 
 class SnapshotService:
     def __init__(self):
-        # Mock DB for snapshots
-        self.snapshots_db: Dict[uuid.UUID, List[Dict]] = {}
+        self.pg = PostgresClient()
 
     def take_snapshot(self, state: EntityState) -> str:
         """
-        Persists current state as a checkpoint.
-        Returns the snapshot ID (or hash).
+        Persists current state as a checkpoint in Postgres.
+        Returns the snapshot hash.
         """
-        state_json = state.json()
+        state_json = state.model_dump_json() # Use Pydantic V2
         state_hash = hashlib.sha256(state_json.encode()).hexdigest()
 
-        snapshot_record = {
-            "id": uuid.uuid4(),
-            "entity_id": state.entity_id,
-            "last_event_id": state.last_event_id,
-            "state_data": state.current_value,
-            "truth_vector": state.truth_vector,
-            "timestamp": state.updated_at,
-            "state_hash": state_hash
-        }
+        with self.pg.get_cursor() as cur:
+            cur.execute("""
+                INSERT INTO snapshots (entity_id, last_event_id, state_data, truth_vector, timestamp, state_hash)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (
+                str(state.entity_id),
+                str(state.last_event_id),
+                json.dumps(state.current_value),
+                state.truth_vector.model_dump_json(),
+                state.updated_at,
+                state_hash
+            ))
+            snap_id = cur.fetchone()[0]
 
-        if state.entity_id not in self.snapshots_db:
-            self.snapshots_db[state.entity_id] = []
-        self.snapshots_db[state.entity_id].append(snapshot_record)
-
-        log.info(f"Snapshot taken for {state.entity_id} at event {state.last_event_id}")
+        log.info(f"Snapshot taken for {state.entity_id} at {state.updated_at} (ID: {snap_id})")
         return state_hash
 
-    def get_latest_snapshot(self, entity_id: uuid.UUID) -> Optional[EntityState]:
-        """Retrieves the most recent snapshot."""
-        if entity_id not in self.snapshots_db:
+    def get_latest_snapshot(self, entity_id: uuid.UUID, before_time: Optional[datetime] = None) -> Optional[EntityState]:
+        """
+        Retrieves the most recent snapshot for an entity.
+        If before_time is provided, gets the latest snapshot BEFORE that time (for Timewarp).
+        """
+        query = """
+            SELECT entity_id, last_event_id, state_data, truth_vector, timestamp
+            FROM snapshots
+            WHERE entity_id = %s
+        """
+        params = [str(entity_id)]
+
+        if before_time:
+            query += " AND timestamp < %s"
+            params.append(before_time)
+
+        query += " ORDER BY timestamp DESC LIMIT 1"
+
+        with self.pg.get_cursor() as cur:
+            cur.execute(query, tuple(params))
+            row = cur.fetchone()
+
+        if not row:
             return None
 
-        # Sort by timestamp desc (simple list mock)
-        snaps = sorted(self.snapshots_db[entity_id], key=lambda x: x['timestamp'], reverse=True)
-        if not snaps:
-            return None
+        # Reconstruct State
+        # We need namespace. Snapshots table doesn't have it (schema oversight?).
+        # We can fetch it from entities table or assume 'user' or pass it in.
+        # Let's fetch from entities table for correctness.
+        with self.pg.get_cursor() as cur:
+            cur.execute("SELECT namespace FROM entities WHERE id = %s", (str(entity_id),))
+            ns_row = cur.fetchone()
+            # Handle RealDictCursor (dict) or standard cursor (tuple)
+            if ns_row:
+                if isinstance(ns_row, dict):
+                    namespace = ns_row.get('namespace', "user")
+                else:
+                    namespace = ns_row[0]
+            else:
+                namespace = "user"
 
-        latest = snaps[0]
+        tv_data = row['truth_vector']
+        if isinstance(tv_data, str): tv_data = json.loads(tv_data)
+
         return EntityState(
-            entity_id=entity_id,
-            namespace="user", # Need to store namespace in snapshot ideally
-            current_value=latest["state_data"],
-            truth_vector=latest["truth_vector"],
-            last_event_id=latest["last_event_id"],
-            updated_at=latest["timestamp"]
+            entity_id=row['entity_id'],
+            namespace=namespace,
+            current_value=row['state_data'],
+            truth_vector=TruthVector(**tv_data),
+            version=0, # Snapshot doesn't track version explicitly in Phase 4 schema, assume synced
+            last_event_id=row['last_event_id'],
+            updated_at=row['timestamp']
         )
 
-class ReplayService:
-    def __init__(self, snapshot_service: SnapshotService):
-        self.snapshot_service = snapshot_service
-        # Mock Event Store
-        self.event_store: Dict[uuid.UUID, List[Event]] = {}
-
-    def add_event_to_log(self, event: Event):
-        if event.object_id not in self.event_store:
-            self.event_store[event.object_id] = []
-        self.event_store[event.object_id].append(event)
-
-    def replay_events(self, entity_id: uuid.UUID, target_time=None) -> EntityState:
+    def compact_snapshots(self, entity_id: uuid.UUID, retention_days: int = 30):
         """
-        Reconstructs state by loading latest snapshot < target_time
-        and replaying subsequent events.
+        Deletes old snapshots, keeping only 1 per day/week based on policy.
+        For now: Delete everything older than retention_days.
         """
-        # 1. Load Snapshot
-        snapshot = self.snapshot_service.get_latest_snapshot(entity_id)
-
-        # 2. Get Events
-        all_events = self.event_store.get(entity_id, [])
-        # Sort by time
-        all_events.sort(key=lambda x: x.timestamp)
-
-        # 3. Determine Replay Start
-        start_index = 0
-        current_state = None
-
-        if snapshot:
-            # Validate snapshot isn't *after* target_time (if time travel)
-            # For simplistic "Current State" replay:
-            current_state = snapshot
-            # Find where to start in event list
-            # Ideally DB query: SELECT * FROM events WHERE timestamp > snapshot.timestamp
-            for i, e in enumerate(all_events):
-                if e.id == snapshot.last_event_id:
-                    start_index = i + 1
-                    break
-        else:
-            # Init empty state
-            if not all_events:
-                return None
-            first_evt = all_events[0]
-            # Create a dummy empty state to start application
-            current_state = EntityState(
-                entity_id=entity_id,
-                namespace=first_evt.namespace,
-                current_value={},
-                truth_vector=first_evt.truth_vector, # placeholder
-                last_event_id=uuid.uuid4()
-            )
-
-        # 4. Replay Loop
-        for i in range(start_index, len(all_events)):
-            evt = all_events[i]
-            # Time travel check
-            if target_time and evt.timestamp > target_time:
-                break
-
-            current_state = StateDerivationService.apply_event(current_state, evt)
-
-        return current_state
+        with self.pg.get_cursor() as cur:
+            cur.execute("""
+                DELETE FROM snapshots
+                WHERE entity_id = %s AND timestamp < NOW() - INTERVAL '%s days'
+            """, (str(entity_id), retention_days))
+        log.info(f"Compacted snapshots for {entity_id}")
