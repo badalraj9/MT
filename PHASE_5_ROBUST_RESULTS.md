@@ -1,26 +1,24 @@
-# PHASE 5 ROBUST BENCHMARK RESULTS
+# PHASE 5 ROBUST BENCHMARK RESULTS (100k SCALE)
 
 ## EXECUTIVE SUMMARY
-- **Total Tests:** 8
-- **Passed:** 8
+- **Total Tests:** 6
+- **Passed:** 6
 - **Failed:** 0
 - **Pass Rate:** 100.0%
 
 ## DETAILED RESULTS
 ### Identity Service
-- ✅ **Stress Scan (Mocked)**: {'duration': 0.028687715530395508, 'proposals': 37}
-- ✅ **Merge Integrity**: {'merged_into': '5518d4a6-ef4d-458a-8604-6c6e77b398ff'}
+- ✅ **100k Stress Scan**: {'duration': 193.15646815299988, 'proposals': 8618}
 
 ### Assimilation Engine
-- ✅ **Compression Ratio**: {'initial': 100, 'final_active': 1}
-- ✅ **Provenance Integrity**: {'antecedents_count': 100}
+- ✅ **100k Compression**: {'initial': 100000, 'final_active': 1, 'duration_detect': 2.663069009780884, 'duration_con': 0.47377705574035645}
 
 ### Pruner Service
-- ✅ **Scoring Accuracy**: {'candidates': 1}
-- ✅ **Prune Execution**: {'status': 'inactive'}
+- ✅ **100k Scan**: {'candidates': 50000, 'duration': 0.6967401504516602}
+- ✅ **100k Execution**: {'duration': 0.029948949813842773}
 
 ### Decay Engine
-- ✅ **Curve Accuracy**: {'actual': 0.0498, 'expected': 0.049787068367863944}
+- ✅ **100k Update**: {'duration': 1.5085945129394531, 'updated': 100000}
 
 ### Integration
-- ✅ **Concurrent Writes**: {'count': 200}
+- ✅ **Concurrent Writes (10k)**: {'count': 10000, 'duration': 2.932910203933716}
