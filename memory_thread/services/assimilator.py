@@ -153,7 +153,7 @@ class AssimilatorService:
                 summary_event.actor.value, summary_event.action.value, str(summary_event.object_id),
                 json.dumps(summary_event.delta),
                 [str(uid) for uid in summary_event.antecedents], # Postgres array of UUIDs
-                json.dumps(summary_event.truth_vector)
+                summary_event.truth_vector.model_dump_json()
             ))
 
             # 2. Update Source Events
