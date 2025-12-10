@@ -12,3 +12,5 @@ venv/
 # Logs
 *.log
 server.log
+tests/phase5_ordeal/mock_db.json
+tests/phase5_ordeal_v2/
