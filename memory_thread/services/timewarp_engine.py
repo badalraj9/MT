@@ -1,12 +1,11 @@
 import uuid
-from datetime import datetime, timezone
-from typing import List, Dict, Tuple, Optional, Any
 import json
+from typing import Dict, Any, Optional
+from datetime import datetime, timezone
 
-from memory_thread.models.events import Event, EntityState, DeltaPatch, TruthVector, ActorEnum, ActionEnum, Provenance
+from memory_thread.models.events import Event, EntityState
 from memory_thread.services.snapshot_service import SnapshotService
 from memory_thread.services.replay_service import ReplayService
-from memory_thread.services.tms_service import TMSService, StateDerivationService
 from memory_thread.db.postgres_client import PostgresClient
 from memory_thread.utils.logger import get_logger
 
@@ -15,128 +14,94 @@ log = get_logger(__name__)
 class TimewarpEngine:
     def __init__(self):
         self.snapshot_service = SnapshotService()
-        # self.replay_service = ReplayService() # Removed dependency to avoid circular or redundant logic
         self.pg = PostgresClient()
-        self.tms = TMSService()
 
-    def insert_late_event(self, event: Event) -> Dict[str, Any]:
+    def insert_late_event(self, event: Event, save_mismatch_path: Optional[str] = None) -> Dict[str, Any]:
         """
-        Inserts a late event and repairs the timeline.
-        1. Insert event into DB (Chronological/Append log).
-        2. Identify affected entities.
-        3. Recompute state from T(event).
+        Insert a late event, recompute canonical state via ReplayService, persist entity_state, save snapshot.
+        Returns dict with status and debug info.
         """
-        # Serialize fields manually as PostgresClient might expect specific format or handled by adapter
-        delta_json = json.dumps([d.dict() for d in event.delta])
-        truth_json = event.truth_vector.json()
-        antecedents_json = json.dumps([str(u) for u in event.antecedents])
-        provenance_json = event.provenance.json() if event.provenance else None
-
+        rs = ReplayService()
+        # 1) Insert late event into events table
+        # Use a short transaction to insert then commit so replay can see it
         with self.pg.get_cursor() as cur:
-             cur.execute("""
+            cur.execute("""
                 INSERT INTO events (
                     id, namespace, timestamp, actor, action, object_id,
                     delta, antecedents, truth_vector, provenance,
                     gateway_seq, dedup_hash
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
-                str(event.id), event.namespace, event.timestamp,
-                event.actor.value, event.action.value, str(event.object_id),
-                delta_json,
-                antecedents_json,
-                truth_json,
-                provenance_json,
-                event.gateway_seq,
-                event.dedup_hash
+                str(event.id),
+                event.namespace,
+                event.timestamp,
+                event.actor.value if hasattr(event.actor, "value") else event.actor,
+                event.action.value if hasattr(event.action, "value") else event.action,
+                str(event.object_id),
+                json.dumps([d.model_dump() if hasattr(d, "model_dump") else d.__dict__ for d in (event.delta or [])]),
+                json.dumps([str(a) for a in (event.antecedents or [])]),
+                event.truth_vector.model_dump() if hasattr(event.truth_vector, "model_dump") else (event.truth_vector.__dict__ if event.truth_vector else None),
+                event.provenance.model_dump() if (event.provenance and hasattr(event.provenance, "model_dump")) else (event.provenance.__dict__ if event.provenance else None),
+                getattr(event, "gateway_seq", None),
+                getattr(event, "dedup_hash", None)
             ))
+            # commit is automatic after context exit if using connection pool
 
-        # 2. Recompute State
-        new_state = self._recompute_state(event.object_id)
+        # Acquire an advisory lock on the entity to prevent concurrent repairs / writes
+        # Using hashtext for simplicity as agreed
+        lock_sql = "SELECT pg_advisory_lock(hashtext(%s))"
+        unlock_sql = "SELECT pg_advisory_unlock(hashtext(%s))"
 
-        # 3. Update State in DB
-        # TODO: This direct update is Phase 3 style. Phase 4/6 might require snapshot update.
-        # But this function ensures 'current_state' in DB reflects the corrected timeline.
+        try:
+            with self.pg.get_cursor() as cur:
+                cur.execute(lock_sql, (str(event.object_id),))
 
-        if new_state:
+            # 2) Capture golden trace (now includes late event)
+            trace = rs.capture_trace(event.object_id)
+
+            # 3) Replay trace deterministically
+            ok, diffs, actual_state = rs.replay_trace(trace, save_mismatch_path=save_mismatch_path)
+
+            if not ok:
+                # Save trace + diffs for triage if not done by replay_trace
+                return {"status": "replay_failed", "diffs": diffs}
+
+            # 4) Persist repaired state and snapshot atomically
+            # Use last_event_id/timestamp from actual_state
+            # Fallback logic handled by ReplayService state derivation, but double check
+            last_evt_ts = actual_state.updated_at
+            last_evt_id = actual_state.last_event_id
+            version = getattr(actual_state, "version", None)
+
             with self.pg.get_cursor() as cur:
                 cur.execute("""
                     UPDATE entity_state
-                    SET current_value = %s, truth_vector = %s, last_event_id = %s, updated_at = %s, version = version + 1
+                    SET current_value = %s, truth_vector = %s, last_event_id = %s, updated_at = %s, version = %s
                     WHERE entity_id = %s
                 """, (
-                    json.dumps(new_state.current_value),
-                    new_state.truth_vector.json(),
-                    str(new_state.last_event_id),
-                    datetime.now(timezone.utc),
-                    str(new_state.entity_id)
+                    json.dumps(actual_state.current_value),
+                    actual_state.truth_vector.model_dump() if hasattr(actual_state.truth_vector, "model_dump") else actual_state.truth_vector.__dict__,
+                    str(last_evt_id) if last_evt_id else None,
+                    last_evt_ts,
+                    version,
+                    str(actual_state.entity_id)
                 ))
 
-        log.info(f"Timewarp: Repaired state for {event.object_id} after late event {event.id}")
-        return {"status": "repaired", "new_state": new_state.current_value if new_state else {}}
+            # 5) Persist canonical snapshot via SnapshotService
+            try:
+                self.snapshot_service.take_snapshot(actual_state)
+            except Exception:
+                log.exception("Snapshot save failed (nonfatal)")
 
-    def _recompute_state(self, entity_id: uuid.UUID) -> Optional[EntityState]:
-        """
-        Rebuilds state from scratch using ALL events in DB (including the new late one).
-        """
-        with self.pg.get_cursor() as cur:
-            cur.execute("""
-                SELECT id, namespace, timestamp, actor, action, object_id, delta, antecedents, truth_vector, provenance, gateway_seq, dedup_hash
-                FROM events
-                WHERE object_id = %s
-                ORDER BY gateway_seq ASC
-            """, (str(entity_id),))
-            rows = cur.fetchall()
+            # 6) Emit maintenance/orchestrator event or log
+            log.info("Timewarp repaired entity %s after late event %s", str(event.object_id), str(event.id))
 
-        if not rows:
-            return None
+            return {"status": "repaired", "entity": str(event.object_id), "new_version": version}
 
-        # Rehydrate and Replay
-        first_row = rows[0]
-
-        # Helper to hydrate TruthVector safely
-        def get_tv(row):
-             d = row['truth_vector']
-             if isinstance(d, str): d = json.loads(d)
-             if isinstance(d, dict): return TruthVector(**d)
-             # Fallback
-             return TruthVector(confidence=0, authority=0, corroboration=0)
-
-        # Helper to hydrate Delta
-        def get_delta(row):
-            d = row['delta']
-            if isinstance(d, str): d = json.loads(d)
-            if isinstance(d, list): return [DeltaPatch(**x) for x in d]
-            return []
-
-        initial_tv = get_tv(first_row)
-
-        current_state = EntityState(
-            entity_id=entity_id,
-            namespace=first_row['namespace'],
-            current_value={},
-            truth_vector=initial_tv,
-            version=0,
-            last_event_id=uuid.UUID(first_row['id']),
-            updated_at=first_row['timestamp'] # Use event timestamp for initial state time
-        )
-
-        for r in rows:
-            evt = Event(
-                id=uuid.UUID(r['id']),
-                namespace=r['namespace'],
-                timestamp=r['timestamp'],
-                actor=ActorEnum(r['actor']),
-                action=ActionEnum(r['action']),
-                object_id=uuid.UUID(r['object_id']),
-                delta=get_delta(r),
-                antecedents=[uuid.UUID(u) for u in (json.loads(r['antecedents']) if isinstance(r['antecedents'], str) else r['antecedents'] or [])],
-                truth_vector=get_tv(r),
-                provenance=Provenance(**(json.loads(r['provenance']) if isinstance(r['provenance'], str) else r['provenance'])) if r['provenance'] else None,
-                gateway_seq=r['gateway_seq'],
-                dedup_hash=r['dedup_hash']
-            )
-
-            current_state = StateDerivationService.apply_event(current_state, evt)
-
-        return current_state
+        finally:
+            # release advisory lock
+            try:
+                with self.pg.get_cursor() as cur:
+                    cur.execute(unlock_sql, (str(event.object_id),))
+            except Exception:
+                log.exception("Failed to release advisory lock for entity %s", str(event.object_id))

@@ -46,7 +46,7 @@ class ReplayService:
                 SELECT id, namespace, timestamp, actor, action, object_id, delta, antecedents, truth_vector, provenance, gateway_seq, dedup_hash
                 FROM events
                 WHERE object_id = %s
-                ORDER BY timestamp ASC, id ASC
+                ORDER BY timestamp ASC, gateway_seq ASC NULLS LAST, id ASC
             """, (str(entity_id),))
             rows = cur.fetchall()
         return rows or []
