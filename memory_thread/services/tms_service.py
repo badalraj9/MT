@@ -1,40 +1,38 @@
 import uuid
-import datetime
-from typing import Dict, Any, List
-from memory_thread.models.events import Event, EntityState, TruthVector, ActorEnum, ActionEnum
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional
+from memory_thread.models.events import Event, EntityState, TruthVector, ActorEnum, ActionEnum, DeltaPatch, DeltaOp
 from memory_thread.utils.logger import get_logger
 
 log = get_logger(__name__)
 
 class TruthVectorService:
     @staticmethod
-    def calculate_score(vector: TruthVector) -> float:
+    def calculate_score(vector: TruthVector, freshness_ts: Optional[datetime] = None) -> float:
         # Placeholder weights - moving to settings later
         W1, W2, W3, W4 = 1.0, 1.0, 1.0, 1.0
 
-        # Simple heuristic for now
-        # log(1 + corroboration)
         import math
         corr_score = math.log(1 + vector.corroboration)
 
+        # Freshness is derived, not stored
+        freshness_val = 1.0
+        if freshness_ts:
+             # Example decay: 1.0 / (days + 1)
+             age = (datetime.now(timezone.utc) - freshness_ts).total_seconds() / 86400
+             freshness_val = 1.0 / (age + 1.0)
+
         score = (W1 * vector.confidence) + \
                 (W2 * vector.authority) + \
-                (W3 * vector.freshness) + \
+                (W3 * freshness_val) + \
                 (W4 * corr_score)
         return score
-
-    @staticmethod
-    def decay_freshness(vector: TruthVector, event_time: datetime.datetime) -> float:
-        # Placeholder decay logic
-        # For now, just return current freshness
-        return vector.freshness
 
 class StateDerivationService:
     @staticmethod
     def apply_event(current_state: EntityState, event: Event) -> EntityState:
         """
         Derives S(t+1) from S(t) + Event.
-        Strategy: Merges delta into current_value.
         """
         if event.object_id != current_state.entity_id:
             raise ValueError("Event object_id mismatch")
@@ -42,75 +40,50 @@ class StateDerivationService:
         # Create new value dictionary (copy)
         new_value = current_state.current_value.copy()
 
-        # Apply Delta (Simple dictionary merge/update for now)
-        # For numeric fields like 'tree_count', we might want mathematical ops
-        # But since delta is generic JSON, we assume 'replace' or specific logic per field type
-        # Simplistic implementation: key-value update
-        for k, v in event.delta.items():
-            if isinstance(v, (int, float)) and k in new_value and isinstance(new_value[k], (int, float)):
-                # If both are numbers, add them?
-                # The "5000 Trees" problem implies ADD/REMOVE actions carry a numeric delta.
-                # Event: Action=ADD, delta={tree_count: 10} -> S_new = S_old + 10
-                if event.action in [ActionEnum.ADD, ActionEnum.PLANT]:
-                     new_value[k] += v
-                elif event.action == ActionEnum.REMOVE:
-                     new_value[k] -= v
-                elif event.action == ActionEnum.UPDATE:
-                     new_value[k] = v
-            else:
-                # Default replacement
-                new_value[k] = v
+        # Apply Delta Patches
+        for patch in event.delta:
+            path = patch.path
+            val = patch.value
+            op = patch.op
 
-        # Resolve Truth Vector
-        # If new event has higher Authority/Score, it dominates.
-        # But here we are deriving state *from* an accepted event, so the state inherits the event's truth
-        # combined with previous state?
-        # For Phase 3.4, we assume the latest event in the DAG becomes the current truth state
-        # but we must track version.
+            # Simplified path handling (flat dict)
+            # In real system: json pointer resolution
+
+            if op == DeltaOp.ADD:
+                if path in new_value and isinstance(new_value[path], (int, float)) and isinstance(val, (int, float)):
+                    new_value[path] += val
+                else:
+                    new_value[path] = val
+            elif op == DeltaOp.REMOVE:
+                 if path in new_value and isinstance(new_value[path], (int, float)) and isinstance(val, (int, float)):
+                    new_value[path] -= val
+                 elif path in new_value:
+                    del new_value[path]
+            elif op == DeltaOp.REPLACE:
+                 new_value[path] = val
 
         return EntityState(
             entity_id=current_state.entity_id,
             namespace=current_state.namespace,
             current_value=new_value,
-            truth_vector=event.truth_vector, # State adopts latest event truth
+            truth_vector=event.truth_vector,
             version=current_state.version + 1,
             last_event_id=event.id,
-            updated_at=datetime.datetime.utcnow()
+            updated_at=datetime.now(timezone.utc)
         )
 
 class TMSService:
     def __init__(self):
         pass
 
-    def create_event(self,
+    # Method signature updated to reflect lack of defaults
+    def create_event_proposal(self,
                      actor: ActorEnum,
                      action: ActionEnum,
                      object_id: uuid.UUID,
-                     delta: Dict[str, Any],
+                     delta: List[DeltaPatch],
                      namespace: str = "user") -> Event:
 
-        # Default Truth Vector (can be enhanced later)
-        tv = TruthVector(
-            confidence=1.0,
-            authority=1.0,
-            freshness=1.0,
-            corroboration=0.0
-        )
-
-        event = Event(
-            actor=actor,
-            action=action,
-            object_id=object_id,
-            delta=delta,
-            namespace=namespace,
-            truth_vector=tv
-        )
-
-        # In a real app, we would write to DB here
-        log.info(f"Created Event: {event.id} ({action} {object_id})")
-        return event
-
-    def get_current_state(self, entity_id: uuid.UUID) -> EntityState:
-        # Mock fetch from DB
-        # In reality: SELECT * FROM entity_state WHERE entity_id = ...
-        pass
+        # This function can't create a valid Event anymore because it can't determine ID or Timestamp deterministically without input
+        # It's better to rename it to 'construct_event' or accept external params
+        raise NotImplementedError("Events must be created at the Gateway or via factory with deterministic ID")

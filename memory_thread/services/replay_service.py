@@ -2,10 +2,10 @@ import json
 import logging
 from typing import Dict, Any, List, Optional, Tuple
 from uuid import UUID
-from datetime import datetime
+from datetime import datetime, timezone
 import difflib
 
-from memory_thread.models.events import Event, EntityState, TruthVector
+from memory_thread.models.events import Event, EntityState, TruthVector, DeltaPatch, Provenance
 from memory_thread.services.tms_service import StateDerivationService
 from memory_thread.db.postgres_client import PostgresClient
 from memory_thread.utils.logger import get_logger
@@ -50,11 +50,9 @@ class ReplayService:
         )
 
         # 2. Fetch All Events
-        # We need them in strict causal order.
-        # For Phase 3/4, we assume timestamp/serial ordering is sufficient for linear history.
         with self.pg.get_cursor() as cur:
             cur.execute("""
-                SELECT id, namespace, timestamp, actor, action, object_id, delta, antecedents, truth_vector
+                SELECT id, namespace, timestamp, actor, action, object_id, delta, antecedents, truth_vector, provenance
                 FROM events
                 WHERE object_id = %s
                 ORDER BY timestamp ASC
@@ -66,6 +64,17 @@ class ReplayService:
             tv_data = r['truth_vector']
             if isinstance(tv_data, str): tv_data = json.loads(tv_data)
 
+            delta_data = r['delta']
+            if isinstance(delta_data, str): delta_data = json.loads(delta_data)
+            deltas = [DeltaPatch(**d) for d in delta_data]
+
+            antecedents_data = r['antecedents']
+            if isinstance(antecedents_data, str): antecedents_data = json.loads(antecedents_data)
+
+            prov_data = r['provenance']
+            if isinstance(prov_data, str): prov_data = json.loads(prov_data)
+            prov = Provenance(**prov_data) if prov_data else None
+
             events.append(Event(
                 id=r['id'],
                 namespace=r['namespace'],
@@ -73,14 +82,15 @@ class ReplayService:
                 actor=r['actor'],
                 action=r['action'],
                 object_id=r['object_id'],
-                delta=r['delta'],
-                antecedents=r['antecedents'] or [],
-                truth_vector=TruthVector(**tv_data)
+                delta=deltas,
+                antecedents=antecedents_data or [],
+                truth_vector=TruthVector(**tv_data),
+                provenance=prov
             ))
 
         trace = {
             "entity_id": str(entity_id),
-            "captured_at": datetime.utcnow().isoformat(),
+            "captured_at": datetime.now(timezone.utc).isoformat(),
             "final_state": json.loads(final_state.model_dump_json()),
             "events": [json.loads(e.model_dump_json()) for e in events]
         }
@@ -94,53 +104,45 @@ class ReplayService:
         events_data = trace['events']
         expected_state_data = trace['final_state']
 
-        # 1. Initialize State (S0)
-        # We assume starting from empty/scratch for this entity
-        # Or we need the S0 state if the trace is partial.
-        # For now, we assume trace is FULL history.
-
-        first_evt = events_data[0]
-        # Create initial state manually or handle first event specially?
-        # StateDerivationService usually needs a current state.
-        # Let's create an empty state.
+        first_evt_data = events_data[0]
+        # Hydrate initial state logic
+        # Assuming empty start if no S0 provided
 
         current_state = EntityState(
             entity_id=UUID(trace['entity_id']),
-            namespace=first_evt['namespace'],
+            namespace=first_evt_data['namespace'],
             current_value={},
-            truth_vector=TruthVector(confidence=0, authority=0, freshness=0, corroboration=0),
+            truth_vector=TruthVector(confidence=0, authority=0, corroboration=0),
             version=0,
-            last_event_id=UUID(first_evt['id']), # Temporary placeholder
-            updated_at=datetime.utcnow()
+            last_event_id=UUID(first_evt_data['id']),
+            updated_at=datetime.now(timezone.utc)
         )
 
-        # 2. Replay Loop
         for i, evt_data in enumerate(events_data):
-            # Convert JSON back to Event object
-            evt = Event(**evt_data)
+            # Safe rehydration
+            # If using Pydantic V2, model_validate(dict) is preferred. But using **dict for now.
+            # Complex fields might need manual hydration if JSON didn't serialize them perfectly flat.
+            # But Event(***) should work if the dict structure matches.
+            try:
+                 evt = Event(**evt_data)
+            except Exception as e:
+                # If DeltaPatch objects are dicts inside, Pydantic should auto-convert
+                return False, [f"Hydration error at Event #{i}: {e}"], None
 
             try:
-                # Apply Logic
                 current_state = StateDerivationService.apply_event(current_state, evt)
             except Exception as e:
                 return False, [f"Crash at Event #{i} ({evt.id}): {e}"], current_state
 
         # 3. Compare Result
-        # Convert expected to object for comparison (or compare dicts)
         expected_state = EntityState(**expected_state_data)
 
-        # Normalize for comparison (ignore updated_at drift if any)
-        # We compare critical fields: current_value, truth_vector, version
-
         diffs = []
-
-        # Compare Values
         if current_state.current_value != expected_state.current_value:
             diffs.append("State Value Mismatch:")
             diffs.append(f"Expected: {expected_state.current_value}")
             diffs.append(f"Actual:   {current_state.current_value}")
 
-        # Compare Truth Vector (allow slight float tolerance?)
         tv_act = current_state.truth_vector.dict()
         tv_exp = expected_state.truth_vector.dict()
 
@@ -148,7 +150,6 @@ class ReplayService:
             if abs(tv_act.get(k, 0) - v) > 0.0001:
                 diffs.append(f"TruthVector mismatch on '{k}': Exp={v}, Act={tv_act.get(k)}")
 
-        # Result
         success = len(diffs) == 0
         return success, diffs, current_state
 
