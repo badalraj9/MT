@@ -53,6 +53,10 @@ class Provenance(BaseModel):
     gateway_seq: int
     source_system: Optional[str] = None
 
+    # Lineage tracking for derived events
+    root_event: Optional[uuid.UUID] = None
+    derived_from: Optional[str] = None
+
     class Config:
         frozen = True
 
