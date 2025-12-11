@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings
 import os
+import uuid
 
 class Settings(BaseSettings):
     POSTGRES_USER: str = os.environ.get("POSTGRES_USER", "user")
@@ -19,5 +20,8 @@ class Settings(BaseSettings):
     SCORE_WEIGHT_GRAPH: float = 0.15
     SCORE_WEIGHT_IMPORTANCE: float = 0.1
     SCORE_WEIGHT_RECENCY: float = 0.05
+
+    # Event Identity Namespace (Stable Project UUID)
+    EVENT_NAMESPACE_UUID: uuid.UUID = uuid.UUID(os.environ.get("EVENT_NAMESPACE_UUID", "01234567-89ab-cdef-0123-456789abcdef"))
 
 settings = Settings()

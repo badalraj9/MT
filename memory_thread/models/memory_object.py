@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import Optional, List, Literal
 from pydantic import BaseModel, Field
+from datetime import datetime
 import uuid
 
 MemoryType = Literal["identity", "preference", "event", "fact", "task", "belief", "timeline", "other"]
@@ -10,7 +11,7 @@ class MemoryMetadata(BaseModel):
     source: MemorySource = "user"
     negation: bool = False
     emotion: Optional[str] = None
-    deadline: Optional[str] = None # Datetime strings are safer for serialization if needed, but staying consistent with type hints usually prefers datetime. However, to be safe on serialization, I'll stick to basic types or expect explicit handling. Let's keep it simple.
+    deadline: Optional[datetime] = None
 
     class Config:
         frozen = True

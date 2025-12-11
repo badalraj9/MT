@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Dict, Optional, Any, Literal
 from enum import Enum
 from datetime import datetime
@@ -28,10 +28,20 @@ class DeltaPatch(BaseModel):
     path: str
     value: Any
 
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, v: str) -> str:
+        if not (v.startswith("/") or "." in v):
+            raise ValueError("Invalid delta path: must be JSON pointer (/) or dot-path (.)")
+        return v
+
+    class Config:
+        frozen = True
+
 class TruthVector(BaseModel):
     confidence: float = Field(..., ge=0.0, le=1.0)
     authority: float = Field(..., ge=0.0, le=1.0)
-    # freshness removed - derived property
+    # freshness removed
     corroboration: float = Field(..., ge=0.0)
 
     class Config:
@@ -40,22 +50,27 @@ class TruthVector(BaseModel):
 class Provenance(BaseModel):
     producer_id: str
     gateway_timestamp: datetime
+    gateway_seq: int
     source_system: Optional[str] = None
 
     class Config:
         frozen = True
 
 class Event(BaseModel):
-    id: uuid.UUID # No default factory - must be deterministic
-    namespace: str # No default "user" - must be explicit
-    timestamp: datetime # No default factory
+    id: uuid.UUID
+    namespace: str
+    timestamp: datetime
     actor: ActorEnum
     action: ActionEnum
     object_id: uuid.UUID
-    delta: List[DeltaPatch] # Typed delta
+    delta: List[DeltaPatch]
     antecedents: List[uuid.UUID] = Field(default_factory=list)
     truth_vector: TruthVector
-    provenance: Optional[Provenance] = None
+    provenance: Provenance # Mandatory
+
+    # New deterministic fields
+    gateway_seq: int
+    dedup_hash: Optional[str] = None
 
     class Config:
         frozen = True
@@ -67,7 +82,7 @@ class EntityState(BaseModel):
     truth_vector: TruthVector
     version: int = 0
     last_event_id: uuid.UUID
-    updated_at: datetime # No default factory
+    updated_at: datetime
 
     class Config:
         frozen = True

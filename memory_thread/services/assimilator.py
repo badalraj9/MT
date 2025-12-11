@@ -7,73 +7,38 @@ from collections import defaultdict
 from uuid import NAMESPACE_DNS, uuid5
 
 from memory_thread.models.events import Event, ActionEnum, ActorEnum, DeltaPatch, DeltaOp, TruthVector, Provenance
-from memory_thread.db.postgres_client import PostgresClient
+from memory_thread.db.postgres_client import EventStore
 from memory_thread.utils.logger import get_logger
+from memory_thread.utils.ids import canonical_json_for_event, deterministic_event_id_from_payload, compute_dedup_hash
 
 log = get_logger(__name__)
 
 class AssimilatorService:
     def __init__(self):
-        self.pg = PostgresClient()
+        self.store = EventStore()
 
     def detect_patterns(self, entity_id: uuid.UUID, window_days: int = 30) -> List[List[Event]]:
         """
         Finds groups of events that are candidates for consolidation.
         """
+        # EventStore.list_events_by_object could be used if it supports filtering by time
+        # Or we add a method to EventStore
+        # For now, using direct query via store cursor for custom filter
+
         cutoff_date = datetime.now(timezone.utc) - timedelta(days=window_days)
 
-        # Note: Event model has changed. Fetch logic needs update to match DB schema and Model
-        # DB schema probably still matches model, but we need to rehydrate correctly.
-        # This service connects to DB directly, so it needs to handle the row->model conversion manually or via helper.
-
-        # NOTE: self.pg.get_cursor() needs to be updated if PostgresClient changed?
-        # PostgresClient now has `get_cursor` context manager.
-
-        with self.pg.get_cursor() as cur:
+        with self.store.get_cursor() as cur:
             cur.execute("""
-                SELECT id, namespace, timestamp, actor, action, object_id, delta, antecedents, truth_vector, provenance
+                SELECT *
                 FROM events
                 WHERE object_id = %s
                   AND timestamp > %s
                   AND consolidated_into IS NULL
-                ORDER BY timestamp ASC
+                ORDER BY gateway_seq ASC
             """, (str(entity_id), cutoff_date))
-
             rows = cur.fetchall()
 
-        events = []
-        for row in rows:
-            # Rehydrate logic (duplicated from EventStore temporarily or could use EventStore)
-            # Row index access is unsafe with RealDictCursor?
-            # User provided code uses indices: row[0], row[1]...
-            # But PostgresClient uses RealDictCursor by default.
-            # Assuming RealDictCursor:
-
-            delta_raw = row['delta'] if isinstance(row['delta'], list) else json.loads(row['delta'])
-            deltas = [DeltaPatch(**d) for d in delta_raw]
-
-            antecedents_raw = row['antecedents'] if isinstance(row['antecedents'], list) else json.loads(row['antecedents'])
-            antecedents = [uuid.UUID(u) for u in antecedents_raw]
-
-            tv_raw = row['truth_vector'] if isinstance(row['truth_vector'], dict) else json.loads(row['truth_vector'])
-
-            prov = None
-            if row['provenance']:
-                p_raw = row['provenance'] if isinstance(row['provenance'], dict) else json.loads(row['provenance'])
-                prov = Provenance(**p_raw)
-
-            events.append(Event(
-                id=uuid.UUID(row['id']),
-                namespace=row['namespace'],
-                timestamp=row['timestamp'],
-                actor=ActorEnum(row['actor']),
-                action=ActionEnum(row['action']),
-                object_id=uuid.UUID(row['object_id']),
-                delta=deltas,
-                antecedents=antecedents,
-                truth_vector=TruthVector(**tv_raw),
-                provenance=prov
-            ))
+        events = [self.store._row_to_event(r) for r in rows]
 
         # Grouping logic
         groups = []
@@ -86,8 +51,6 @@ class AssimilatorService:
             prev = current_group[-1]
             curr = events[i]
 
-            # Compare Deltas Structurally
-            # Set of (path, op) tuples
             prev_structure = set((d.path, d.op) for d in prev.delta)
             curr_structure = set((d.path, d.op) for d in curr.delta)
 
@@ -119,8 +82,6 @@ class AssimilatorService:
         first = events[0]
 
         # 1. Aggregate Delta
-        # We need to look at specific paths.
-        # Group deltas by path.
         path_deltas = defaultdict(list)
         for e in events:
             for d in e.delta:
@@ -130,18 +91,11 @@ class AssimilatorService:
 
         for path, deltas in path_deltas.items():
             first_delta = deltas[0]
-            # Heuristic aggregation based on Op
-            # If ADD + Number -> Sum
-            # If REPLACE -> Last
-
             if first_delta.op == DeltaOp.ADD:
                 try:
                     total = sum(d.value for d in deltas)
                     consolidated_deltas.append(DeltaPatch(op=DeltaOp.ADD, path=path, value=total))
                 except TypeError:
-                    # Non-summable, fallback to last? Or list?
-                    # "Add Item X", "Add Item Y" -> List of items?
-                    # For simplicty/strictness, if we can't sum, we might not consolidate or just take last state.
                     consolidated_deltas.append(deltas[-1])
             elif first_delta.op == DeltaOp.REMOVE:
                  try:
@@ -150,26 +104,59 @@ class AssimilatorService:
                  except TypeError:
                     consolidated_deltas.append(deltas[-1])
             else:
-                # REPLACE / UPDATE -> Last One Wins
                 consolidated_deltas.append(deltas[-1])
 
-        # 2. Create Summary Event
-        source_ids = [e.id for e in events]
+        # 2. Allocate ID & Sequence (Need System Access)
+        # Summary events are SYSTEM events. They should go through Gateway ideally.
+        # But we are in a background service.
+        # We must follow the rules: Deterministic ID, Sequence from DB.
 
-        # Deterministic ID for summary?
-        # Hash of (first_id, last_id, count)
-        summary_id = uuid5(NAMESPACE_DNS, f"SUMMARY-{events[0].id}-{events[-1].id}-{len(events)}")
+        gateway_ts = datetime.now(timezone.utc)
+
+        # Payload for ID
+        # Summary ID logic: usually derived from content or source IDs
+        # Here we use content-based ID logic (canonical json of summary)
+        # But wait, to be deterministic we need inputs.
+
+        raw_summary = {
+            "namespace": first.namespace,
+            "actor": "SYSTEM",
+            "action": first.action,
+            "object_id": str(first.object_id),
+            "delta": [d.dict() for d in consolidated_deltas],
+            "truth_vector": first.truth_vector.dict(),
+            "timestamp": gateway_ts
+        }
+
+        canon = canonical_json_for_event(raw_summary)
+        event_id = deterministic_event_id_from_payload(raw_summary)
+        d_hash = compute_dedup_hash(canon)
+
+        # Fetch Sequence
+        seq_values = self.store.fetch_next_gateway_seq(1)
+        seq = seq_values[0]
+
+        # Provenance
+        prov = Provenance(
+            producer_id="assimilator_service",
+            gateway_timestamp=gateway_ts,
+            gateway_seq=seq,
+            source_system="internal_maintenance"
+        )
 
         summary_event = Event(
-            id=summary_id,
+            id=event_id,
             namespace=first.namespace,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=gateway_ts,
             actor=ActorEnum.SYSTEM,
             action=first.action,
             object_id=first.object_id,
             delta=consolidated_deltas,
-            antecedents=source_ids,
-            truth_vector=first.truth_vector # Inherit from first for now
+            antecedents=[e.id for e in events], # Link sources
+            truth_vector=first.truth_vector,
+            provenance=prov,
+            gateway_seq=seq,
+            dedup_hash=d_hash
         )
 
         return summary_event
@@ -177,25 +164,29 @@ class AssimilatorService:
     def execute_consolidation(self, summary_event: Event, source_events: List[Event]):
         """
         Writes the summary event and marks source events as consolidated.
+        Atomic transaction.
         """
-        # Need to serialize carefully for DB
+        # Serialize fields using EventStore logic helper or manually
         delta_json = json.dumps([d.dict() for d in summary_event.delta])
         truth_json = summary_event.truth_vector.json()
         antecedents_json = json.dumps([str(u) for u in summary_event.antecedents])
-        provenance_json = summary_event.provenance.json() if summary_event.provenance else None
+        provenance_json = summary_event.provenance.json()
 
-        with self.pg.get_cursor() as cur:
+        with self.store.get_cursor() as cur:
             # 1. Insert Summary Event
             cur.execute("""
-                INSERT INTO events (id, namespace, timestamp, actor, action, object_id, delta, antecedents, truth_vector, provenance)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO events (
+                    id, namespace, timestamp, actor, action, object_id,
+                    delta, antecedents, truth_vector, provenance,
+                    gateway_seq, dedup_hash
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (namespace, object_id, dedup_hash) DO NOTHING
             """, (
                 str(summary_event.id), summary_event.namespace, summary_event.timestamp,
                 summary_event.actor.value, summary_event.action.value, str(summary_event.object_id),
-                delta_json,
-                antecedents_json,
-                truth_json,
-                provenance_json
+                delta_json, antecedents_json, truth_json, provenance_json,
+                summary_event.gateway_seq, summary_event.dedup_hash
             ))
 
             # 2. Update Source Events

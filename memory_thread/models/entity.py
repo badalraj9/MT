@@ -1,5 +1,6 @@
 from typing import Optional
 from uuid import UUID
+from datetime import datetime
 from pydantic import BaseModel, Field
 
 class Entity(BaseModel):
@@ -28,7 +29,7 @@ class EntityMergeLog(BaseModel):
     target_entity_id: UUID
     confidence: float
     reason: str
-    timestamp: str # ISO format string or datetime passed in explicitly
+    timestamp: datetime # Strict datetime
 
     class Config:
         frozen = True
