@@ -34,15 +34,21 @@ class TimewarpEngine:
 
         with self.pg.get_cursor() as cur:
              cur.execute("""
-                INSERT INTO events (id, namespace, timestamp, actor, action, object_id, delta, antecedents, truth_vector, provenance)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO events (
+                    id, namespace, timestamp, actor, action, object_id,
+                    delta, antecedents, truth_vector, provenance,
+                    gateway_seq, dedup_hash
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 str(event.id), event.namespace, event.timestamp,
                 event.actor.value, event.action.value, str(event.object_id),
                 delta_json,
                 antecedents_json,
                 truth_json,
-                provenance_json
+                provenance_json,
+                event.gateway_seq,
+                event.dedup_hash
             ))
 
         # 2. Recompute State
@@ -75,10 +81,10 @@ class TimewarpEngine:
         """
         with self.pg.get_cursor() as cur:
             cur.execute("""
-                SELECT id, namespace, timestamp, actor, action, object_id, delta, antecedents, truth_vector, provenance
+                SELECT id, namespace, timestamp, actor, action, object_id, delta, antecedents, truth_vector, provenance, gateway_seq, dedup_hash
                 FROM events
                 WHERE object_id = %s
-                ORDER BY timestamp ASC
+                ORDER BY gateway_seq ASC
             """, (str(entity_id),))
             rows = cur.fetchall()
 
@@ -126,7 +132,9 @@ class TimewarpEngine:
                 delta=get_delta(r),
                 antecedents=[uuid.UUID(u) for u in (json.loads(r['antecedents']) if isinstance(r['antecedents'], str) else r['antecedents'] or [])],
                 truth_vector=get_tv(r),
-                provenance=Provenance(**(json.loads(r['provenance']) if isinstance(r['provenance'], str) else r['provenance'])) if r['provenance'] else None
+                provenance=Provenance(**(json.loads(r['provenance']) if isinstance(r['provenance'], str) else r['provenance'])) if r['provenance'] else None,
+                gateway_seq=r['gateway_seq'],
+                dedup_hash=r['dedup_hash']
             )
 
             current_state = StateDerivationService.apply_event(current_state, evt)

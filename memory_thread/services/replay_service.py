@@ -43,7 +43,7 @@ class ReplayService:
         """
         with self.pg.get_cursor() as cur:
             cur.execute("""
-                SELECT id, namespace, timestamp, actor, action, object_id, delta, antecedents, truth_vector, provenance
+                SELECT id, namespace, timestamp, actor, action, object_id, delta, antecedents, truth_vector, provenance, gateway_seq, dedup_hash
                 FROM events
                 WHERE object_id = %s
                 ORDER BY timestamp ASC, id ASC
@@ -181,22 +181,6 @@ class ReplayService:
                 prov_data = json.loads(prov_data)
             prov = Provenance(**prov_data) if prov_data else None
 
-            # The row might not have new fields like gateway_seq/dedup_hash if using old query
-            # But the new query selects them? NO, the new query in _fetch_event_rows explicitly selects columns.
-            # Make sure it selects ALL columns needed by Event model.
-            # Event model requires: gateway_seq, dedup_hash (optional but strict model might fail if missing).
-            # The query above selects: id, namespace, timestamp, actor, action, object_id, delta, antecedents, truth_vector, provenance
-            # IT IS MISSING gateway_seq!
-            # The new strict Event model has `gateway_seq: int`.
-            # If we don't fetch it, hydration will fail.
-            # I must update _fetch_event_rows to include gateway_seq and dedup_hash.
-            # Wait, the user provided the code. The user provided code MIGHT be missing it?
-            # Let's check the user provided code in previous turn.
-            # "SELECT id, namespace, timestamp, actor, action, object_id, delta, antecedents, truth_vector, provenance FROM events ..."
-            # Yes, it is missing gateway_seq.
-            # But the Event model I defined earlier HAS gateway_seq as mandatory field.
-            # I should fix the query in _fetch_event_rows inside the file I'm writing.
-
             evt_dict = {
                 "id": r['id'],
                 "namespace": r['namespace'],
@@ -208,8 +192,8 @@ class ReplayService:
                 "antecedents": antecedents_data or [],
                 "truth_vector": tv_data or {},
                 "provenance": prov,
-                "gateway_seq": r.get('gateway_seq', 0), # Fallback if not fetched?
-                "dedup_hash": r.get('dedup_hash')
+                "gateway_seq": r['gateway_seq'],
+                "dedup_hash": r['dedup_hash']
             }
             # hydrate with our helper to keep types stable
             events.append(self._hydrate_event(evt_dict))
