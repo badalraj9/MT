@@ -23,13 +23,26 @@ def retrieve_memories(query: str, top_k: int = 10, graph_filter: Dict = None) ->
     # Generate embedding for the query
     query_embedding = generate_embeddings((query,))[0]
 
-    # Get candidates from Qdrant: Returns list of (id, score) tuples
+    # Get candidates from Qdrant: Returns list of (id_str, score) tuples
     vector_results = search_vectors(query_embedding, top_k=40)
-    vector_scores = {uuid.UUID(vid): score for vid, score in vector_results}
+
+    # Safely convert to UUID and map
+    vector_scores = {}
+    for vid, score in vector_results:
+        try:
+            vector_scores[uuid.UUID(str(vid))] = score
+        except ValueError:
+            log.warning(f"Invalid UUID from vector search: {vid}")
+            continue
 
     # 2. Keyword Search
     keyword_results = graph_service.keyword_search_memories(q=query, k=20)
-    keyword_scores = {uuid.UUID(str(res['id'])): res.get('keyword_score', 0.0) for res in keyword_results}
+    keyword_scores = {}
+    for res in keyword_results:
+        try:
+            keyword_scores[uuid.UUID(str(res['id']))] = res.get('keyword_score', 0.0)
+        except ValueError:
+            continue
 
     # Combine candidates
     all_ids = set(vector_scores.keys()) | set(keyword_scores.keys())
@@ -46,7 +59,11 @@ def retrieve_memories(query: str, top_k: int = 10, graph_filter: Dict = None) ->
 
     # 3. Scoring & Reranking
     for memory_data in memories_data:
-        memory_id = uuid.UUID(str(memory_data['id']))
+        # memory_data['id'] should be a UUID from get_memories_by_ids (Postgres)
+        # but check just in case
+        memory_id = memory_data['id']
+        if isinstance(memory_id, str):
+            memory_id = uuid.UUID(memory_id)
 
         # Graph Connectivity Score
         neighbors = graph_service.get_neighbors(memory_id)
@@ -58,8 +75,10 @@ def retrieve_memories(query: str, top_k: int = 10, graph_filter: Dict = None) ->
         k_score = keyword_scores.get(memory_id, 0.0)
 
         # Metadata Scores
-        # truth_vector is stored in memory_data, e.g. {"confidence": 0.9, ...}
         truth = memory_data.get('truth_vector', {})
+        # Truth vector might be a dict or object.
+        # In this context (from DB), it's likely a dict.
+        if hasattr(truth, 'dict'): truth = truth.dict()
         confidence = float(truth.get('confidence', 0.5))
 
         created_at = memory_data.get('created_at')
@@ -72,11 +91,10 @@ def retrieve_memories(query: str, top_k: int = 10, graph_filter: Dict = None) ->
             recency = 0.99 ** max(0, delta_days)
 
         # Final Weighted Score
-        # Weights should be in settings, defaulting here if not present
         w_vector = getattr(settings, 'SCORE_WEIGHT_VECTOR', 1.0)
         w_keyword = getattr(settings, 'SCORE_WEIGHT_KEYWORD', 1.0)
         w_graph = getattr(settings, 'SCORE_WEIGHT_GRAPH', 1.0)
-        w_freshness = getattr(settings, 'SCORE_WEIGHT_FRESHNESS', 1.0) # Using recency
+        w_freshness = getattr(settings, 'SCORE_WEIGHT_FRESHNESS', 1.0)
         w_truth = getattr(settings, 'SCORE_WEIGHT_TRUTH', 1.0)
 
         final_score = (

@@ -61,19 +61,18 @@ def infer(entity_id: str):
         engine = InferenceEngine()
 
         typer.echo("Running inference...")
-        engine.infer_transitive_relations(eid)
-        engine.infer_symmetry(eid)
-        engine.infer_inverse(eid)
-        conflicts = engine.infer_contradictions(eid)
+        results = engine.apply_rules(eid)
 
-        if conflicts:
-            typer.echo(f"Found {len(conflicts)} conflicts:")
-            for c in conflicts:
+        typer.echo(f"Inference Complete. Rules Triggered: {len(results['rules_triggered'])}")
+        for rule_name in results['rules_triggered']:
+            typer.echo(f" - Rule: {rule_name}")
+
+        if results['conflicts']:
+            typer.echo(f"Found {len(results['conflicts'])} conflicts:")
+            for c in results['conflicts']:
                 typer.echo(f" - {c['message']}")
         else:
             typer.echo("No conflicts found.")
-
-        typer.echo("Inference complete.")
 
     except ValueError:
         typer.echo("Invalid UUID.")

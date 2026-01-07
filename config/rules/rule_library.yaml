@@ -1,0 +1,49 @@
+# Rule Library for Phase 8.1 - Semantic + Symbolic Fusion
+
+rules:
+  # --- HIERARCHICAL RULES ---
+  - name: hierarchical_affiliation
+    type: inference
+    description: "If A works at B, and B is part of C, then A is affiliated with C"
+    pattern:
+      - { source: "?person", relation: "works_at", target: "?dept" }
+      - { source: "?dept", relation: "part_of", target: "?org" }
+    infer:
+      source: "?person"
+      relation: "affiliated_with"
+      target: "?org"
+      confidence_factor: 0.9
+
+  # --- INVERSE RULES ---
+  - name: parent_child_inverse
+    type: inverse
+    description: "If A is parent of B, then B is child of A"
+    pattern:
+      - { source: "?parent", relation: "parent_of", target: "?child" }
+    infer:
+      source: "?child"
+      relation: "child_of"
+      target: "?parent"
+      confidence_factor: 1.0
+
+  # --- TEMPORAL RULES ---
+  - name: temporal_transitivity
+    type: inference
+    description: "If A caused B, and B caused C, then A caused C (indirectly)"
+    pattern:
+      - { source: "?eventA", relation: "caused", target: "?eventB" }
+      - { source: "?eventB", relation: "caused", target: "?eventC" }
+    infer:
+      source: "?eventA"
+      relation: "caused"
+      target: "?eventC"
+      confidence_factor: 0.8
+      metadata: { "type": "indirect_causation" }
+
+  # --- SOCIAL RULES (Planned) ---
+  # - name: friend_of_friend
+  #   pattern: ...
+
+  # --- CONTRADICTION RULES (Planned) ---
+  # - name: location_conflict
+  #   pattern: ...

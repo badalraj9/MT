@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Query
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from uuid import UUID
 from pydantic import BaseModel
 
@@ -49,9 +49,11 @@ async def run_inference(entity_id: UUID):
     Run inference rules on an entity and check for contradictions.
     """
     engine = InferenceEngine()
-    engine.infer_transitive_relations(entity_id)
-    engine.infer_symmetry(entity_id)
-    engine.infer_inverse(entity_id)
-    conflicts = engine.infer_contradictions(entity_id)
+    results = engine.apply_rules(entity_id)
 
-    return {"status": "completed", "conflicts": conflicts}
+    return {
+        "status": "completed",
+        "inferred_relations": results["inferred_relations"],
+        "rules_triggered": results["rules_triggered"],
+        "conflicts": results["conflicts"]
+    }
