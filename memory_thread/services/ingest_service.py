@@ -6,12 +6,13 @@ import uuid
 import datetime
 from typing import List, Union, Dict, Any
 from memory_thread.utils.shared_memory import SlabAllocator
-from memory_thread.services.hybrid_ner_service import extract_entities
+from memory_thread.services.extract_service import extract_structured_data
 from memory_thread.utils.embeddings import generate_embeddings
 from memory_thread.models.events import Event, EntityState, ActorEnum, ActionEnum
 from memory_thread.services.classify_service import classify_memory
 from memory_thread.services.tms_service import TMSService, StateDerivationService
 from memory_thread.services.meta_stability_service import MetaStabilityService
+from memory_thread.services.graph_service import GraphService
 from memory_thread.utils.logger import get_logger
 from memory_thread.utils.shared_cache import result_cache
 from memory_thread.nervous.persistence_engine import PersistenceEngine
@@ -41,6 +42,7 @@ def worker_process(allocator: SlabAllocator, persistence_engine: Any): # Note: p
 
     tms_service = TMSService()
     meta_service = MetaStabilityService()
+    graph_service = GraphService()
 
     while True:
         slab = allocator.get_written_slab()
@@ -63,11 +65,41 @@ def worker_process(allocator: SlabAllocator, persistence_engine: Any): # Note: p
                 else:
                     text = raw_data.decode('utf-8')
 
-                # 2. META-STABILITY CHECK (Layer 0)
+                # 2. EXTRACTION (Relations)
+                extracted_data = {}
+                if text:
+                    try:
+                        extracted_data = extract_structured_data(text)
+
+                        # Store relations immediately (Side Effect)
+                        # In a pure event-sourcing model, this should probably be an event too.
+                        # But for now, we write directly to the graph as per Phase 7 pragmatism.
+                        relations = extracted_data.get("relations", [])
+                        for rel in relations:
+                            # We need UUIDs for entities.
+                            # If they don't exist, we might need to resolve them or create placeholder UUIDs.
+                            # For simplicity, we'll hash the name to get a consistent UUID or look it up.
+                            # Using UUID5 with namespace for deterministic IDs
+                            from memory_thread.config.settings import settings
+                            ns = uuid.UUID(settings.EVENT_NAMESPACE_UUID)
+
+                            src_id = uuid.uuid5(ns, rel["source_name"].lower())
+                            tgt_id = uuid.uuid5(ns, rel["target_name"].lower())
+
+                            graph_service.add_relation(
+                                src_id, tgt_id, rel["relation_type"],
+                                confidence=rel.get("confidence", 1.0),
+                                metadata={"source_text": text}
+                            )
+
+                    except Exception as e:
+                        log.warning(f"Extraction failed: {e}")
+
+                # 3. META-STABILITY CHECK (Layer 0)
                 if meta_service.check_drift(text, domain="general"):
                     log.warning("Drift detected, quarantining event.")
 
-                # 3. TMS PIPELINE (Layer 1 -> Layer 2)
+                # 4. TMS PIPELINE (Layer 1 -> Layer 2)
                 if "action" in content_obj and "delta" in content_obj:
                     action = ActionEnum[content_obj.get("action", "UPDATE")]
                     delta = content_obj.get("delta", {})
@@ -75,7 +107,7 @@ def worker_process(allocator: SlabAllocator, persistence_engine: Any): # Note: p
                     object_id = uuid.UUID(object_id_str) if object_id_str else uuid.uuid4()
                 else:
                     action = ActionEnum.UPDATE
-                    delta = {"content": text}
+                    delta = {"content": text, "extracted": extracted_data}
                     object_id = uuid.uuid4()
 
                 event = tms_service.create_event(
@@ -98,7 +130,7 @@ def worker_process(allocator: SlabAllocator, persistence_engine: Any): # Note: p
                 if not meta_service.check_integrity(new_state):
                     log.error("State integrity check failed!")
 
-                # 4. OUTPUT TO ZMQ (Q2 -> Q3)
+                # 5. OUTPUT TO ZMQ (Q2 -> Q3)
                 output_payload = {
                     "event": event.dict(),
                     "state": new_state.dict(),

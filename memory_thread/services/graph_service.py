@@ -1,7 +1,7 @@
 import uuid
 import json
 import logging
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 from datetime import datetime
 
 from memory_thread.db.postgres_client import PostgresClient
@@ -56,7 +56,7 @@ class GraphService:
             sql += "target_entity_id = %s"
             params.append(str(entity_id))
         else:
-            sql += "source_entity_id = %s OR target_entity_id = %s"
+            sql += "(source_entity_id = %s OR target_entity_id = %s)"
             params.append(str(entity_id))
             params.append(str(entity_id))
 
@@ -69,3 +69,54 @@ class GraphService:
     def delete_relation(self, relation_id: uuid.UUID):
         with self.pg.get_cursor() as cur:
             cur.execute("DELETE FROM relations WHERE id = %s", (str(relation_id),))
+
+    def get_neighbors(self, entity_id: uuid.UUID) -> List[Dict]:
+        """
+        Returns a list of neighbor relations (outgoing).
+        Compatible with retrieval service usage.
+        """
+        return self.get_relations(entity_id, direction="out")
+
+    def get_memories_by_ids(self, ids: List[uuid.UUID]) -> List[Dict]:
+        """
+        Fetches entity states by IDs.
+        """
+        if not ids:
+            return []
+
+        str_ids = [str(id_) for id_ in ids]
+        with self.pg.get_cursor() as cur:
+            # Using ANY for list of IDs
+            cur.execute("""
+                SELECT
+                    entity_id as id,
+                    current_value as content,
+                    truth_vector,
+                    updated_at as created_at,
+                    'entity' as type
+                FROM entity_state
+                WHERE entity_id = ANY(%s)
+            """, (str_ids,))
+            rows = cur.fetchall()
+
+        return [dict(row) for row in rows]
+
+    def keyword_search_memories(self, q: str, k: int = 20) -> List[Dict]:
+        """
+        Simple keyword search using ILIKE on the JSONB content.
+        For production this should use Full Text Search (tsvector).
+        """
+        with self.pg.get_cursor() as cur:
+            cur.execute("""
+                SELECT
+                    entity_id as id,
+                    current_value as content,
+                    truth_vector,
+                    1.0 as keyword_score -- Placeholder score
+                FROM entity_state
+                WHERE current_value::text ILIKE %s
+                LIMIT %s
+            """, (f"%{q}%", k))
+            rows = cur.fetchall()
+
+        return [dict(row) for row in rows]

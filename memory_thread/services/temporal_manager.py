@@ -1,6 +1,6 @@
 from typing import List, Dict
 from memory_thread.models.events import Event, EntityState
-from memory_thread.services.snapshot_service import ReplayService
+from memory_thread.services.replay_service import ReplayService
 from memory_thread.utils.logger import get_logger
 
 log = get_logger(__name__)
