@@ -4,47 +4,63 @@
 
 This is the most performance-critical path in the system. It handles the intake of raw data and its conversion into a structured Event.
 
-**Flow:**
-1.  **Request:** User sends `POST /memory/ingest` with raw text or JSON.
-2.  **Allocation:** The API Gateway requests a memory slab from the `SlabAllocator`.
-3.  **Fast Write:** The raw bytes are written to Shared Memory. The API returns `202 Accepted` immediately.
-4.  **Worker Pickup:** A background `worker_process` (in `ingest_service.py`) detects the "filled" slab.
-5.  **Processing:**
-    *   **Deserialization:** Bytes -> JSON.
-    *   **Meta-Stability:** `check_drift()` and `check_integrity()` run to reject malformed thoughts.
-    *   **TMS Creation:** `TMSService.create_event()` generates a UUID and calculates the initial `TruthVector`.
-    *   **Derivation:** `StateDerivationService.apply_event()` calculates the new Entity State in-memory.
-6.  **Transmission:** The Event and New State are pushed to the `PersistenceEngine` via ZeroMQ (`queue_manager.py`).
+**Algorithm:**
+1.  **Receive Request:** API accepts `POST /ingest` with payload $P$.
+2.  **Slab Allocation (Lock-Free):**
+    *   `allocator.reserve_slab()` pops an index $i$ from the free stack.
+    *   If stack is empty, return 503 (Backpressure).
+3.  **Binary Write:**
+    *   Compute length $L = \text{len}(P)$.
+    *   Write 4-byte header: `struct.pack('!I', L)`.
+    *   Write $L$ bytes of $P$ to `shared_memory[i*size + 4]`.
+    *   Set `metadata[i] = WRITTEN`.
+4.  **Async Response:** Return HTTP 202 to client immediately.
+5.  **Worker Processing:**
+    *   Worker loop scans for `metadata[i] == WRITTEN`.
+    *   **Deserialization:** Read $L$, decode bytes to JSON.
+    *   **Drift Check:** `MetaStabilityService.check_drift(content)`.
+    *   **Event Creation:** `TMSService.create_event(delta=content)`.
+        *   Assign UUID, Timestamp.
+        *   Init TruthVector $(1, 1, 1, 0)$.
+    *   **State Derivation:** $S_{new} = \text{Apply}(S_{old}, E)$.
+    *   **Release Slab:** `allocator.release_slab(i)`.
+6.  **Persistence Push:** Send $(E, S_{new})$ to `PersistenceEngine` via ZeroMQ.
 
 ## 2. The Retrieval Workflow (Hybrid Search)
 
 Retrieval is not a simple database lookup; it is a reconstruction of knowledge.
 
-**Flow:**
-1.  **Query:** User asks "What does Alice do?"
-2.  **Vector Search (Recall):** The query is embedded (Vectors) and sent to Qdrant to find the top 100 semantically similar memories.
-3.  **Graph Filtering (Precision):** (Phase 7) The results are filtered by graph constraints (e.g., "Must be related to entity 'Alice'").
+**Algorithm:**
+1.  **Query Analysis:** Input query $Q$.
+2.  **Vector Search (Recall):**
+    *   Embed $Q \rightarrow V_q$.
+    *   Query Qdrant: `search(collection="memories", vector=V_q, limit=100)`.
+    *   Result set $R_{vec} = \{ (doc_i, score_i) \}$.
+3.  **Graph Filtering (Precision):**
+    *   Extract entities $E_q$ from $Q$.
+    *   Query Graph: Find neighbors $N(E_q)$.
+    *   Filter $R_{vec}$: Keep $doc_i$ only if $doc_i$ relates to $N(E_q)$.
 4.  **Truth Ranking (Trust):**
-    *   Each candidate memory has a `TruthVector`.
-    *   Score = $C \times A \times F \times \log(R)$
-    *   Low-confidence hallucinations are down-ranked.
-5.  **Response:** The top N results are returned, sorted by "Cognitive Reality" rather than just similarity.
+    *   For each candidate $d \in R_{filtered}$:
+    *   Calculate $S = w_1 C_d + w_2 A_d + w_3 F_d + w_4 \log(1 + R_d)$.
+    *   Sort by $S$ descending.
+5.  **Response:** Return top $k$ results.
 
 ## 3. The Replay Workflow (Time Travel)
 
 This is the "Crown Jewel" feature for debugging and correctness.
 
-**Flow:**
-1.  **Trigger:** Developer requests `capture_trace(entity_id)`.
-2.  **Fetch History:** `ReplayService` queries Postgres for **all** events for that `object_id`, sorted strictly by `timestamp ASC`.
-3.  **Simulation (The "Clean Room"):**
-    *   An empty state $S_0$ is created.
-    *   The loop runs: $S_{t+1} = \text{Derive}(S_t, E_t)$ for $t=0 \dots N$.
-    *   This happens in memory, without side effects.
+**Algorithm:**
+1.  **Initialize:** Create empty state $S_{sim} = \emptyset$.
+2.  **Fetch Log:** `SELECT * FROM events WHERE object_id=X ORDER BY timestamp ASC`.
+    *   Result stream $E = [e_0, e_1, \dots, e_n]$.
+3.  **Simulation Loop:**
+    *   For $i = 0$ to $n$:
+    *   $S_{sim} \leftarrow \text{StateDerivationService.apply}(S_{sim}, e_i)$.
 4.  **Verification:**
-    *   The simulated final state $S_{final}$ is compared to the stored state in `entity_state`.
-    *   If they differ by more than $\epsilon$ (1e-6), the system flags a "State Corruption."
-5.  **Timewarp (Optional):** If a new event is inserted at $t=50$, the Replay Service re-runs the simulation from $t=50 \dots N$ to generate the correct new present state.
+    *   Fetch actual current state $S_{db}$ from `entity_state`.
+    *   Compute Diff $D = |S_{sim} - S_{db}|$.
+    *   If $D > \epsilon$ (where $\epsilon = 1e-6$), raise `StateCorruptionError`.
 
 ```mermaid
 sequenceDiagram
@@ -68,9 +84,16 @@ sequenceDiagram
 
 This runs in the background (like sleep) to optimize storage.
 
-**Flow:**
-1.  **Decay:** The `DecayService` lowers the `freshness` score of events based on their age and access frequency.
-2.  **Pruning:** Events with a Truth Score below a threshold (e.g., 0.1) are hard-deleted or archived.
-3.  **Consolidation:** The `Assimilator` looks for clusters of events (using vector similarity) and merges them into a single "Summary Event."
-    *   *Example:* "Run 1km", "Run 2km", "Run 3km" -> "Ran 6km total".
-    *   The original detailed events are marked as `consolidated` (soft delete).
+**Algorithm:**
+1.  **Decay Pass:**
+    *   For each memory $M$:
+    *   Update $M.freshness = M.freshness \cdot e^{-\lambda \Delta t}$.
+2.  **Pruning Pass:**
+    *   If $S(M) < \text{Threshold}_{prune}$ (0.1):
+    *   Mark $M$ as `ARCHIVED`.
+3.  **Assimilation Pass:**
+    *   Identify cluster $C = \{e_1, \dots, e_k\}$ where $\text{similarity}(e_i, e_j) > 0.9$.
+    *   Generate Summary $E_{sum} = \text{LLM}(\text{Summarize}(C))$.
+    *   Assign $E_{sum}.timestamp = \max(e_k.timestamp)$.
+    *   Write $E_{sum}$ to Event Log.
+    *   Soft-delete original cluster $C$.

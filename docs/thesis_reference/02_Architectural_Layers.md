@@ -93,23 +93,23 @@ We employ a **Hybrid Storage Strategy**:
 *   **Role:** Associative memory. "Find me things *like* this."
 *   **Schema:** High-dimensional float vectors + Payload (Metadata).
 
-```mermaid
-graph TD
-    subgraph "The Nervous System"
-        ZMQ[ZeroMQ Fabric]
-        K[Kafka Mirror]
-    end
+---
 
-    subgraph "The Persistence Layer"
-        PG[(Postgres Event Store)]
-        QS[(Qdrant Vector Store)]
-        ES[(Entity State Cache)]
-    end
+## 5. Data Structure Definitions
 
-    Ingest --> ZMQ
-    Ingest --> K
-    ZMQ --> PersistenceEngine
-    PersistenceEngine --> PG
-    PersistenceEngine --> QS
-    PersistenceEngine --> ES
-```
+### 5.1 The Event Object
+The atomic unit of memory.
+*   **ID:** UUID4 (Unique Identifier)
+*   **Timestamp:** UTC Datetime
+*   **Actor:** Enum (`USER`, `AGENT`, `SYSTEM`)
+*   **Action:** Enum (`PLANT`, `ADD`, `REMOVE`, `UPDATE`, `OBSERVE`, `INFER`)
+*   **Object ID:** UUID (The entity being acted upon)
+*   **Delta:** JSON Dictionary (The change payload)
+*   **Truth Vector:** Embedded `TruthVector` object
+
+### 5.2 The Truth Vector
+The tensor of validity.
+*   **Confidence:** Float [0.0 - 1.0]
+*   **Authority:** Float [0.0 - 1.0]
+*   **Freshness:** Float [0.0 - 1.0]
+*   **Corroboration:** Float [0.0 - inf)
