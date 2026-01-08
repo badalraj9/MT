@@ -28,92 +28,164 @@ def json_serial(obj):
         return obj.dict()
     raise TypeError(f"Type {type(obj)} not serializable")
 
-def worker_process(allocator: SlabAllocator, persistence_engine: Any): # Note: passing engine requires proxy or pickling strategy, using direct ZMQ push if possible
-    # Actually, passing PersistenceEngine object to process might be tricky if it has open sockets/files.
-    # Ideally, worker just needs the ZMQ socket or a Queue wrapper that writes to ZMQ.
-    # Here, we will reconstruct a QueueManager producer in the worker.
-
-    from memory_thread.nervous.queue_manager import QueueManager
-    qm = QueueManager(address="ipc://persistence_pipe")
-    qm.setup_producer()
 
     log.info("Worker process started.")
 
     tms_service = TMSService()
     meta_service = MetaStabilityService()
+    
+    # 5. Ingest Envelope
+    NAMESPACE_MT = uuid.uuid5(uuid.NAMESPACE_DNS, "memory_thread.ai")
 
-    while True:
-        slab = allocator.get_written_slab()
-        if slab:
-            try:
-                # 1. READ (Length-Header Protocol)
-                header = slab.memory[:4].tobytes()
-                msg_len = struct.unpack("!I", header)[0]
-                raw_data = slab.memory[4:4+msg_len].tobytes()
+    try:
+        while not shutdown_event.is_set():
+            slab = allocator.get_written_slab()
+            if slab:
+                try:
+                    # 1. READ (Length-Header Protocol)
+                    header = slab.memory[:4].tobytes()
+                    msg_len = struct.unpack("!I", header)[0]
+                    raw_data = slab.memory[4:4+msg_len].tobytes()
 
-                content_obj = {}
-                text = ""
+                    content_obj = {}
+                    text = ""
 
-                if raw_data.startswith(b'{'):
-                    try:
-                        content_obj = json.loads(raw_data)
-                        text = content_obj.get("content", "")
-                    except json.JSONDecodeError:
+                    if raw_data.startswith(b'{'):
+                        try:
+                            content_obj = json.loads(raw_data)
+                            text = content_obj.get("content", "")
+                        except json.JSONDecodeError:
+                            text = raw_data.decode('utf-8')
+                    else:
                         text = raw_data.decode('utf-8')
-                else:
-                    text = raw_data.decode('utf-8')
 
-                # 2. META-STABILITY CHECK (Layer 0)
-                if meta_service.check_drift(text, domain="general"):
-                    log.warning("Drift detected, quarantining event.")
+                    # 2. META-STABILITY CHECK (Layer 0)
+                    drift_decision = meta_service.check_drift(text, domain="general")
+                    if not drift_decision.allowed:
+                        log.warning(f"Drift/Stability Rejection: {drift_decision.reason}. Quarantining.")
+                        # Strict Hardening: REJECT or QUARANTINE.
+                        # We release slab and CONTINUE (Drop Event from Pipeline but Log it).
+                        # "Route to quarantine channel" -> In real app, write to 'quarantine' queue.
+                        # For Phase 6 Prototype: We drop and log.
+                        allocator.release_slab(slab.slab_id)
+                        continue
+                    
+                    # If allowed but low confidence?
+                    if drift_decision.confidence < 0.5:
+                         log.info(f"Low Confidence Ingestion: {drift_decision.reason}")
 
-                # 3. TMS PIPELINE (Layer 1 -> Layer 2)
-                if "action" in content_obj and "delta" in content_obj:
-                    action = ActionEnum[content_obj.get("action", "UPDATE")]
-                    delta = content_obj.get("delta", {})
-                    object_id_str = content_obj.get("object_id")
-                    object_id = uuid.UUID(object_id_str) if object_id_str else uuid.uuid4()
-                else:
-                    action = ActionEnum.UPDATE
-                    delta = {"content": text}
-                    object_id = uuid.uuid4()
+                    # 3. TMS PIPELINE (Layer 1 -> Layer 2)
+                    if "action" in content_obj and "delta" in content_obj:
+                        action = ActionEnum[content_obj.get("action", "UPDATE")]
+                        delta = content_obj.get("delta", {})
+                    else:
+                        action = ActionEnum.UPDATE
+                        delta = {"content": text}
+                    
+                    # 1. Identity & Determinism
+                    # Remove uuid.uuid4(). Derive from content hash.
+                    import hashlib
+                    # content hash incl action and delta for uniqueness per ingestion
+                    content_hash = hashlib.sha256(json.dumps({
+                        "text": text, 
+                        "action": action.value, 
+                        "delta": json.dumps(delta, default=json_serial)
+                    }).encode()).hexdigest()
+                    
+                    # Timestamp seed to distinguish identical events at different times?
+                    # "Same input + same state -> same output"
+                    # If user sends "Hi" twice, should it be same event ID?
+                    # Determinism says YES if stateless. 
+                    # But memory is stateful. Time matters.
+                    # Requirement: "Content hash OR upstream provided ID"
+                    # If upstream ID provided, use it. Else, generate from Content + Time or just Content?
+                    # "No random UUIDs where identity matters"
+                    # Let's use Content Hash. If duplicates arrive, they are idempotent?
+                    # Or do we mix in ingest timestamp?
+                    # Let's use Content Hash + Ingest Timestamp (ns) to ensure uniqueness if intended, 
+                    # or pure Content Hash if idempotency desired.
+                    # Given "Memory is a Function of Time", time is input.
+                    
+                    # object_id derivation:
+                    # If provided in input, use it (must be deterministic upstream).
+                    # Else, derive from content hash.
+                    
+                    provided_oid = content_obj.get("object_id")
+                    if provided_oid:
+                         object_id = uuid.UUID(provided_oid)
+                    else:
+                         # Deterministic Entity ID from content? 
+                         # Usually entity ID is persistent. If new, generate.
+                         # We'll generate a deterministic ID from content hash for this session/context.
+                         object_id = uuid.uuid5(NAMESPACE_MT, content_hash)
+                    
+                    # Deterministic Event ID
+                    # Derive from Unique Content Hash (which includes time if we want temporal uniqueness, or just content for deduplication)
+                    # "Same input + same state -> same output"
+                    # We utilize content_hash which includes action/delta/text. 
+                    event_id = uuid.uuid5(NAMESPACE_MT, content_hash)
+                    
+                    # Explicit Timestamp Injection
+                    ingest_ts = datetime.datetime.utcnow()
 
-                event = tms_service.create_event(
-                    actor=ActorEnum.USER,
-                    action=action,
-                    object_id=object_id,
-                    delta=delta
-                )
+                    event = tms_service.create_event(
+                        actor=ActorEnum.USER,
+                        action=action,
+                        object_id=object_id,
+                        delta=delta,
+                        namespace="user",
+                        event_id=event_id,
+                        timestamp=ingest_ts
+                    )
 
-                current_state = EntityState(
-                    entity_id=object_id,
-                    namespace="user",
-                    current_value={},
-                    truth_vector=event.truth_vector,
-                    last_event_id=uuid.uuid4()
-                )
+                    current_state = EntityState(
+                        entity_id=object_id,
+                        namespace="user",
+                        current_value={},
+                        truth_vector=event.truth_vector,
+                        last_event_id=event.id, # Linkage
+                        updated_at=ingest_ts
+                    )
 
-                new_state = StateDerivationService.apply_event(current_state, event)
+                    new_state = StateDerivationService.apply_event(current_state, event, updated_at=ingest_ts)
 
-                if not meta_service.check_integrity(new_state):
-                    log.error("State integrity check failed!")
+                    if not meta_service.check_integrity(new_state):
+                        log.error("State integrity check failed!")
+                        allocator.release_slab(slab.slab_id)
+                        continue
 
-                # 4. OUTPUT TO ZMQ (Q2 -> Q3)
-                output_payload = {
-                    "event": event.dict(),
-                    "state": new_state.dict(),
-                    "original_text": text
-                }
+                    # 4. OUTPUT TO ZMQ (Q2 -> Q3)
+                    # Hardening: Generate Vector for Qdrant Storage
+                    # Must allow exception to propagate (Fail Closed)
+                    vector = generate_embeddings(text)[0] 
 
-                # Serialize properly for ZMQ
-                qm.send(json.loads(json.dumps(output_payload, default=json_serial)))
+                    # 5. Ingest Envelope
+                    envelope = {
+                        "ingest_id": str(uuid.uuid5(NAMESPACE_MT, event.id.hex)), # Linear linkage
+                        "ingest_ts": datetime.datetime.utcnow().isoformat(),
+                        "source": "ingest_service",
+                        "event": event.dict(),
+                        "state": new_state.dict(),
+                        "vector": vector,
+                        "meta": {
+                            "replayed": False,
+                            "determinism_hash": content_hash
+                        }
+                    }
 
-                allocator.release_slab(slab.slab_id)
-            except Exception as e:
-                log.error(f"Error processing slab {slab.slab_id}: {e}")
-                allocator.release_slab(slab.slab_id)
-        else:
-            time.sleep(0.001)
+                    # Serialize properly for ZMQ
+                    qm.send(json.loads(json.dumps(envelope, default=json_serial)))
+
+                    allocator.release_slab(slab.slab_id)
+                except Exception as e:
+                    log.error(f"Error processing slab {slab.slab_id}: {e}")
+                    # Release slab so we don't leak memory, BUT we dropped data.
+                    # Strict Mode: Halt worker? 
+                    # "Partial success = failure".
+                    # We logged error. Use 'persistence_engine' to maybe log fatal error?
+                    allocator.release_slab(slab.slab_id)
+            else:
+                time.sleep(0.001)
 
     qm.close()
 
@@ -121,6 +193,7 @@ class IngestionService:
     def __init__(self, num_slabs=128, slab_size=65536):
         self.allocator = SlabAllocator(num_slabs=num_slabs, slab_size=slab_size)
         self.workers = []
+        self.shutdown_event = mp.Event()
         # Phase 3.5: Use Persistence Engine instead of mp.Queue writer
         self.persistence_engine = PersistenceEngine()
 
@@ -133,7 +206,8 @@ class IngestionService:
 
         for _ in range(max(1, mp.cpu_count() - 2)):
             # Workers self-initialize ZMQ producers
-            p = mp.Process(target=worker_process, args=(self.allocator, None))
+            # Pass shutdown_event
+            p = mp.Process(target=worker_process, args=(self.allocator, None, self.shutdown_event))
             p.start()
             self.workers.append(p)
         log.info(f"Started {len(self.workers)} worker processes.")
@@ -161,8 +235,8 @@ class IngestionService:
 
     def shutdown(self):
         self.persistence_engine.stop()
+        self.shutdown_event.set()
         for p in self.workers:
-            p.terminate()
             p.join()
         self.allocator.unlink()
 

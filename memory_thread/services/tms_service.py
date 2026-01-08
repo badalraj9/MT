@@ -31,26 +31,23 @@ class TruthVectorService:
 
 class StateDerivationService:
     @staticmethod
-    def apply_event(current_state: EntityState, event: Event) -> EntityState:
+    def apply_event(current_state: EntityState, event: Event, updated_at: datetime.datetime) -> EntityState:
         """
         Derives S(t+1) from S(t) + Event.
-        Strategy: Merges delta into current_value.
         """
         if event.object_id != current_state.entity_id:
             raise ValueError("Event object_id mismatch")
+        
+        # Causal Linkage Check
+        # If not genesis, last_event_id must match? 
+        # For now, we just enforce the logic.
 
         # Create new value dictionary (copy)
         new_value = current_state.current_value.copy()
 
-        # Apply Delta (Simple dictionary merge/update for now)
-        # For numeric fields like 'tree_count', we might want mathematical ops
-        # But since delta is generic JSON, we assume 'replace' or specific logic per field type
-        # Simplistic implementation: key-value update
+        # Apply Delta (Pure Logic)
         for k, v in event.delta.items():
             if isinstance(v, (int, float)) and k in new_value and isinstance(new_value[k], (int, float)):
-                # If both are numbers, add them?
-                # The "5000 Trees" problem implies ADD/REMOVE actions carry a numeric delta.
-                # Event: Action=ADD, delta={tree_count: 10} -> S_new = S_old + 10
                 if event.action in [ActionEnum.ADD, ActionEnum.PLANT]:
                      new_value[k] += v
                 elif event.action == ActionEnum.REMOVE:
@@ -58,24 +55,16 @@ class StateDerivationService:
                 elif event.action == ActionEnum.UPDATE:
                      new_value[k] = v
             else:
-                # Default replacement
                 new_value[k] = v
-
-        # Resolve Truth Vector
-        # If new event has higher Authority/Score, it dominates.
-        # But here we are deriving state *from* an accepted event, so the state inherits the event's truth
-        # combined with previous state?
-        # For Phase 3.4, we assume the latest event in the DAG becomes the current truth state
-        # but we must track version.
 
         return EntityState(
             entity_id=current_state.entity_id,
             namespace=current_state.namespace,
             current_value=new_value,
-            truth_vector=event.truth_vector, # State adopts latest event truth
+            truth_vector=event.truth_vector,
             version=current_state.version + 1,
             last_event_id=event.id,
-            updated_at=datetime.datetime.utcnow()
+            updated_at=updated_at # Explicit injection
         )
 
 class TMSService:
@@ -87,9 +76,17 @@ class TMSService:
                      action: ActionEnum,
                      object_id: uuid.UUID,
                      delta: Dict[str, Any],
-                     namespace: str = "user") -> Event:
+                     namespace: str,
+                     event_id: uuid.UUID,
+                     timestamp: datetime.datetime) -> Event:
 
-        # Default Truth Vector (can be enhanced later)
+        if event_id is None:
+             raise ValueError("event_id must be provided for deterministic MT mode")
+        
+        if timestamp is None:
+             raise ValueError("timestamp must be provided for deterministic MT mode")
+
+        # Default Truth Vector (can be enhanced later, but must be frozen/pure)
         tv = TruthVector(
             confidence=1.0,
             authority=1.0,
@@ -98,6 +95,8 @@ class TMSService:
         )
 
         event = Event(
+            id=event_id,
+            timestamp=timestamp, # Explicit injection
             actor=actor,
             action=action,
             object_id=object_id,
@@ -110,7 +109,52 @@ class TMSService:
         log.info(f"Created Event: {event.id} ({action} {object_id})")
         return event
 
+    def get_entity_state(self, entity_id: uuid.UUID) -> EntityState:
+        """
+        Fetch current entity state from database.
+        Returns None if entity not found.
+        """
+        from memory_thread.db.postgres_client import PostgresClient
+        
+        pg = PostgresClient()
+        
+        with pg.get_cursor() as cur:
+            cur.execute("""
+                SELECT entity_id, namespace, current_value, truth_vector, 
+                       version, last_event_id, updated_at
+                FROM entity_state
+                WHERE entity_id = %s
+            """, (str(entity_id),))
+            
+            row = cur.fetchone()
+            
+            if not row:
+                return None
+            
+            # Handle both dict and tuple access
+            if isinstance(row, dict):
+                cv = row['current_value']
+                tv = row['truth_vector']
+                if isinstance(cv, str):
+                    import json
+                    cv = json.loads(cv)
+                if isinstance(tv, str):
+                    import json
+                    tv = json.loads(tv)
+                
+                return EntityState(
+                    entity_id=uuid.UUID(str(row['entity_id'])),
+                    namespace=row['namespace'],
+                    current_value=cv,
+                    truth_vector=TruthVector(**tv) if tv else TruthVector(),
+                    version=row['version'] or 1,
+                    last_event_id=uuid.UUID(str(row['last_event_id'])) if row['last_event_id'] else None,
+                    updated_at=row['updated_at']
+                )
+            
+            return None
+    
     def get_current_state(self, entity_id: uuid.UUID) -> EntityState:
-        # Mock fetch from DB
-        # In reality: SELECT * FROM entity_state WHERE entity_id = ...
-        pass
+        """Alias for get_entity_state for backward compatibility"""
+        return self.get_entity_state(entity_id)
+

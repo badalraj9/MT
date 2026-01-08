@@ -69,3 +69,74 @@ class GraphService:
     def delete_relation(self, relation_id: uuid.UUID):
         with self.pg.get_cursor() as cur:
             cur.execute("DELETE FROM relations WHERE id = %s", (str(relation_id),))
+
+    def get_inferred_relations(self, entity_id: uuid.UUID) -> List[Dict]:
+        """Get all inferred (rule-generated) relations for an entity"""
+        with self.pg.get_cursor() as cur:
+            cur.execute("""
+                SELECT * FROM relations 
+                WHERE is_inferred = TRUE 
+                  AND (source_entity_id = %s OR target_entity_id = %s)
+            """, (str(entity_id), str(entity_id)))
+            return cur.fetchall()
+
+    def find_path(self, source_id: uuid.UUID, target_id: uuid.UUID, 
+                  max_depth: int = 3) -> Optional[List[Dict]]:
+        """
+        BFS path finding between two entities.
+        Returns list of relations forming the path, or None if no path found.
+        """
+        if source_id == target_id:
+            return []
+        
+        visited = set()
+        queue = [(str(source_id), [])]  # (current_node, path_so_far)
+        
+        with self.pg.get_cursor() as cur:
+            while queue:
+                current, path = queue.pop(0)
+                
+                if len(path) >= max_depth:
+                    continue
+                
+                if current in visited:
+                    continue
+                visited.add(current)
+                
+                # Get outgoing relations
+                cur.execute("""
+                    SELECT source_entity_id, target_entity_id, relation_type, confidence
+                    FROM relations
+                    WHERE source_entity_id = %s
+                """, (current,))
+                
+                for row in cur.fetchall():
+                    tgt = row['target_entity_id'] if isinstance(row, dict) else row[1]
+                    rel = row['relation_type'] if isinstance(row, dict) else row[2]
+                    conf = row['confidence'] if isinstance(row, dict) else row[3]
+                    
+                    new_path = path + [{'from': current, 'to': str(tgt), 'type': rel, 'confidence': conf}]
+                    
+                    if str(tgt) == str(target_id):
+                        return new_path
+                    
+                    queue.append((str(tgt), new_path))
+        
+        return None  # No path found
+
+    def get_common_neighbors(self, entity_a: uuid.UUID, entity_b: uuid.UUID) -> List[Dict]:
+        """Find entities connected to both A and B"""
+        with self.pg.get_cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT r1.target_entity_id as common_entity, 
+                       r1.relation_type as rel_from_a,
+                       r2.relation_type as rel_from_b
+                FROM relations r1
+                JOIN relations r2 ON r1.target_entity_id = r2.target_entity_id
+                WHERE r1.source_entity_id = %s 
+                  AND r2.source_entity_id = %s
+                  AND r1.target_entity_id != %s
+                  AND r1.target_entity_id != %s
+            """, (str(entity_a), str(entity_b), str(entity_a), str(entity_b)))
+            return cur.fetchall()
+

@@ -24,9 +24,9 @@ class TruthVector(BaseModel):
     corroboration: float = Field(..., ge=0.0) # Can be > 1.0 (log scale later)
 
 class Event(BaseModel):
-    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    id: uuid.UUID
     namespace: str = "user"
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime
     actor: ActorEnum
     action: ActionEnum
     object_id: uuid.UUID
@@ -41,4 +41,4 @@ class EntityState(BaseModel):
     truth_vector: TruthVector
     version: int = 0
     last_event_id: uuid.UUID
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime

@@ -1,0 +1,281 @@
+# ============================================================================
+# MEMORY THREAD: RULE LIBRARY
+# ============================================================================
+# Phase 8.1: Semantic + Symbolic Fusion
+# 20+ Inference Rules for Knowledge Graph Reasoning
+# Target: <10ms to apply all rules to 1000 entities
+# ============================================================================
+
+version: "1.0"
+author: "Memory Thread / Antigravity"
+description: "Production-grade inference rules for cognitive substrate"
+
+# ============================================================================
+# GLOBAL SETTINGS
+# ============================================================================
+settings:
+  default_confidence_decay: 0.1  # Per-hop confidence reduction
+  max_chain_depth: 5              # Prevent infinite recursion
+  min_confidence_threshold: 0.3   # Don't create relations below this
+  idempotent: true                # Re-running produces same state
+
+# ============================================================================
+# HIERARCHICAL RULES (3)
+# ============================================================================
+hierarchical:
+  # Rule 1: Hierarchical Affiliation
+  # If A works_at B, and B is_part_of C, then A is_affiliated_with C
+  - name: hierarchical_affiliation
+    description: "Infer affiliation through organizational hierarchy"
+    pattern:
+      - match: { from: "?A", to: "?B", relation: "works_at" }
+      - match: { from: "?B", to: "?C", relation: "is_part_of" }
+    action:
+      create: { from: "?A", to: "?C", relation: "is_affiliated_with" }
+    confidence_formula: "min(conf_1, conf_2) * 0.9"
+    priority: 1
+
+  # Rule 2: Inheritance
+  # If A is_a B, and B has_property P, then A has_property P
+  - name: inheritance
+    description: "Inherit properties through type hierarchy"
+    pattern:
+      - match: { from: "?A", to: "?B", relation: "is_a" }
+      - match: { from: "?B", to: "?P", relation: "has_property" }
+    action:
+      create: { from: "?A", to: "?P", relation: "has_property" }
+    confidence_formula: "min(conf_1, conf_2) * 0.85"
+    priority: 2
+
+  # Rule 3: Part-Whole Transitivity
+  # If A is_part_of B, and B is_part_of C, then A is_part_of C
+  - name: part_whole_transitivity
+    description: "Transitive part-whole relationships"
+    pattern:
+      - match: { from: "?A", to: "?B", relation: "is_part_of" }
+      - match: { from: "?B", to: "?C", relation: "is_part_of" }
+    action:
+      create: { from: "?A", to: "?C", relation: "is_part_of" }
+    confidence_formula: "min(conf_1, conf_2) * 0.9"
+    priority: 1
+
+# ============================================================================
+# INVERSE RULES (3)
+# ============================================================================
+inverse:
+  # Rule 4: Parent-Child Inverse
+  # If A is_parent_of B, then B is_child_of A
+  - name: parent_child_inverse
+    description: "Bidirectional parent-child relationships"
+    pattern:
+      - match: { from: "?A", to: "?B", relation: "is_parent_of" }
+    action:
+      create: { from: "?B", to: "?A", relation: "is_child_of" }
+    confidence_formula: "conf_1"  # Same confidence
+    priority: 0  # Immediate, high priority
+
+  # Rule 5: Employment Inverse
+  # If A employs B, then B works_for A
+  - name: employment_inverse
+    description: "Bidirectional employment"
+    pattern:
+      - match: { from: "?A", to: "?B", relation: "employs" }
+    action:
+      create: { from: "?B", to: "?A", relation: "works_for" }
+    confidence_formula: "conf_1"
+    priority: 0
+
+  # Rule 6: Ownership Inverse
+  # If A owns B, then B is_owned_by A
+  - name: ownership_inverse
+    description: "Bidirectional ownership"
+    pattern:
+      - match: { from: "?A", to: "?B", relation: "owns" }
+    action:
+      create: { from: "?B", to: "?A", relation: "is_owned_by" }
+    confidence_formula: "conf_1"
+    priority: 0
+
+# ============================================================================
+# TEMPORAL RULES (3)
+# ============================================================================
+temporal:
+  # Rule 7: Temporal Transitivity
+  # If A happened_before B, and B happened_before C, then A happened_before C
+  - name: temporal_transitivity
+    description: "Transitive temporal ordering"
+    pattern:
+      - match: { from: "?A", to: "?B", relation: "happened_before" }
+      - match: { from: "?B", to: "?C", relation: "happened_before" }
+    action:
+      create: { from: "?A", to: "?C", relation: "happened_before" }
+    confidence_formula: "min(conf_1, conf_2) * 0.95"
+    priority: 2
+
+  # Rule 8: Causation from Correlation
+  # If A precedes B consistently (>3 times), infer weak causation
+  - name: causation_from_correlation
+    description: "Infer causation from temporal patterns"
+    pattern:
+      - match: { from: "?A", to: "?B", relation: "precedes", min_occurrences: 3 }
+    action:
+      create: { from: "?A", to: "?B", relation: "may_cause" }
+    confidence_formula: "min(0.6, conf_1 * 0.7)"  # Weak causation
+    priority: 3
+
+  # Rule 9: Event Sequence Inference
+  # If A starts_with B, and B ends_with C, infer A contains C
+  - name: event_sequence_inference
+    description: "Infer containment from sequence boundaries"
+    pattern:
+      - match: { from: "?A", to: "?B", relation: "starts_with" }
+      - match: { from: "?A", to: "?C", relation: "ends_with" }
+    action:
+      create: { from: "?A", to: "?C", relation: "contains_sequence" }
+    confidence_formula: "min(conf_1, conf_2) * 0.85"
+    priority: 2
+
+# ============================================================================
+# SOCIAL RULES (3)
+# ============================================================================
+social:
+  # Rule 10: Friend of Friend
+  # If A is_friend_of B, and B is_friend_of C, infer A may_know C
+  - name: friend_of_friend
+    description: "Social network expansion"
+    pattern:
+      - match: { from: "?A", to: "?B", relation: "is_friend_of" }
+      - match: { from: "?B", to: "?C", relation: "is_friend_of" }
+      - constraint: { var: "?A", not_equal: "?C" }  # Don't connect to self
+    action:
+      create: { from: "?A", to: "?C", relation: "may_know" }
+    confidence_formula: "min(conf_1, conf_2) * 0.5"  # Weak inference
+    priority: 3
+
+  # Rule 11: Colleague Inference
+  # If A works_at X, and B works_at X, infer A colleague_of B
+  - name: colleague_inference
+    description: "Infer colleagues from shared workplace"
+    pattern:
+      - match: { from: "?A", to: "?X", relation: "works_at" }
+      - match: { from: "?B", to: "?X", relation: "works_at" }
+      - constraint: { var: "?A", not_equal: "?B" }
+    action:
+      create: { from: "?A", to: "?B", relation: "colleague_of" }
+    confidence_formula: "min(conf_1, conf_2) * 0.8"
+    priority: 2
+
+  # Rule 12: Influence Propagation
+  # If A influences B, and B influences C, infer A indirectly_influences C
+  - name: influence_propagation
+    description: "Transitive influence networks"
+    pattern:
+      - match: { from: "?A", to: "?B", relation: "influences" }
+      - match: { from: "?B", to: "?C", relation: "influences" }
+    action:
+      create: { from: "?A", to: "?C", relation: "indirectly_influences" }
+    confidence_formula: "min(conf_1, conf_2) * 0.6"
+    priority: 3
+
+# ============================================================================
+# CONTRADICTION RULES (3)
+# ============================================================================
+contradiction:
+  # Rule 13: Location Conflict
+  # If A located_in X, and A located_in Y, and X != Y, flag conflict
+  - name: location_conflict
+    description: "Detect impossible simultaneous locations"
+    pattern:
+      - match: { from: "?A", to: "?X", relation: "located_in" }
+      - match: { from: "?A", to: "?Y", relation: "located_in" }
+      - constraint: { var: "?X", not_equal: "?Y" }
+      - constraint: { temporal: "overlapping" }
+    action:
+      flag: { entity: "?A", issue: "location_conflict", details: ["?X", "?Y"] }
+    confidence_formula: "max(conf_1, conf_2)"  # Higher conf = more severe
+    priority: 0  # Immediate detection
+
+  # Rule 14: Temporal Impossibility
+  # If A happened_before B, and B happened_before A, flag cycle
+  - name: temporal_impossibility
+    description: "Detect temporal paradoxes"
+    pattern:
+      - match: { from: "?A", to: "?B", relation: "happened_before" }
+      - match: { from: "?B", to: "?A", relation: "happened_before" }
+    action:
+      flag: { entity: "?A", issue: "temporal_paradox", details: ["?B"] }
+    confidence_formula: "1.0"  # Always severe
+    priority: 0
+
+  # Rule 15: Mutual Exclusivity
+  # If A is_a X, and A is_a Y, and X mutually_exclusive Y, flag
+  - name: mutual_exclusivity
+    description: "Detect mutually exclusive type assignments"
+    pattern:
+      - match: { from: "?A", to: "?X", relation: "is_a" }
+      - match: { from: "?A", to: "?Y", relation: "is_a" }
+      - match: { from: "?X", to: "?Y", relation: "mutually_exclusive" }
+    action:
+      flag: { entity: "?A", issue: "type_conflict", details: ["?X", "?Y"] }
+    confidence_formula: "min(conf_1, conf_2)"
+    priority: 0
+
+# ============================================================================
+# BOOSTING RULES (5)
+# ============================================================================
+boosting:
+  # Rule 16: Corroboration Boost
+  # If same fact appears from multiple sources, boost confidence
+  - name: corroboration_boost
+    description: "Increase confidence for corroborated facts"
+    pattern:
+      - match: { from: "?A", to: "?B", relation: "?R", min_sources: 2 }
+    action:
+      boost: { from: "?A", to: "?B", relation: "?R", field: "corroboration" }
+    confidence_formula: "min(1.0, base_conf + 0.1 * source_count)"
+    priority: 1
+
+  # Rule 17: Authority Boost
+  # If source has high authority, boost relation confidence
+  - name: authority_boost
+    description: "Trust authoritative sources more"
+    pattern:
+      - match: { from: "?A", to: "?B", relation: "?R", source_authority: ">0.8" }
+    action:
+      boost: { from: "?A", to: "?B", relation: "?R", field: "authority" }
+    confidence_formula: "base_conf * 1.1"
+    priority: 2
+
+  # Rule 18: Recency Boost
+  # Recent facts get temporary confidence boost
+  - name: recency_boost
+    description: "Temporarily boost recent facts"
+    pattern:
+      - match: { from: "?A", to: "?B", relation: "?R", age_days: "<7" }
+    action:
+      boost: { from: "?A", to: "?B", relation: "?R", field: "freshness" }
+    confidence_formula: "base_conf * (1 + 0.1 * (7 - age_days) / 7)"
+    priority: 3
+
+  # Rule 19: Source Triangulation
+  # If 3+ independent sources agree, significantly boost
+  - name: source_triangulation
+    description: "Strong boost for triangulated facts"
+    pattern:
+      - match: { from: "?A", to: "?B", relation: "?R", independent_sources: ">=3" }
+    action:
+      boost: { from: "?A", to: "?B", relation: "?R", field: "confidence" }
+    confidence_formula: "min(0.99, base_conf + 0.2)"
+    priority: 1
+
+  # Rule 20: Consensus Amplifier
+  # If relation is consistent with overall knowledge graph, slight boost
+  - name: consensus_amplifier
+    description: "Boost facts that fit the knowledge graph"
+    pattern:
+      - match: { from: "?A", to: "?B", relation: "?R" }
+      - constraint: { graph_consistency: ">0.7" }
+    action:
+      boost: { from: "?A", to: "?B", relation: "?R", field: "confidence" }
+    confidence_formula: "base_conf * 1.05"
+    priority: 4
