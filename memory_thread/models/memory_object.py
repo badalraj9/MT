@@ -13,18 +13,18 @@ class MemoryMetadata(BaseModel):
     emotion: Optional[str] = None
     deadline: Optional[datetime] = None
 
+    class Config:
+        frozen = True
+
 class MemoryObject(BaseModel):
-    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    id: uuid.UUID # Deterministic ID required
     content: str
     memory_type: MemoryType
     importance: float = 0.5
     entities: List[str] = Field(default_factory=list)
     topics: List[str] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    last_accessed: datetime = Field(default_factory=datetime.utcnow)
-    relations: List[uuid.UUID] = Field(default_factory=list)
     metadata: MemoryMetadata = Field(default_factory=MemoryMetadata)
     domain: Optional[str] = None
-    current_value: Optional[str] = None
-    history: Optional[List[dict]] = None
-    embedding: Optional[List[float]] = None
+
+    class Config:
+        frozen = True

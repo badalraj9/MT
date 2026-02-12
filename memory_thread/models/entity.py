@@ -1,35 +1,35 @@
-from typing import Dict, Any, Optional
-from uuid import UUID, uuid4
+from typing import Optional
+from uuid import UUID
 from datetime import datetime
 from pydantic import BaseModel, Field
 
 class Entity(BaseModel):
-    id: UUID = Field(default_factory=uuid4)
-    namespace: str = "user"
+    id: UUID
+    namespace: str
     entity_type: str
     name: str
-    attributes: Dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime = Field(default_factory=datetime.now)
-    updated_at: datetime = Field(default_factory=datetime.now)
     merged_into: Optional[UUID] = None
 
     class Config:
-        json_encoders = {
-            datetime: lambda v: v.isoformat(),
-            UUID: lambda v: str(v)
-        }
+        frozen = True
 
 class MergeProposal(BaseModel):
-    source_entity: Entity
-    target_entity: Entity
-    confidence: float
-    reason: str
-    timestamp: datetime = Field(default_factory=datetime.now)
-
-class EntityMergeLog(BaseModel):
-    id: UUID = Field(default_factory=uuid4)
     source_entity_id: UUID
     target_entity_id: UUID
     confidence: float
     reason: str
-    timestamp: datetime = Field(default_factory=datetime.now)
+    # timestamp removed from model default, handle in event/log
+
+    class Config:
+        frozen = True
+
+class EntityMergeLog(BaseModel):
+    id: UUID
+    source_entity_id: UUID
+    target_entity_id: UUID
+    confidence: float
+    reason: str
+    timestamp: datetime # Strict datetime
+
+    class Config:
+        frozen = True

@@ -1,12 +1,11 @@
 import uuid
-from datetime import datetime
-from typing import List, Dict, Tuple, Optional, Any
 import json
+from typing import Dict, Any, Optional
+from datetime import datetime, timezone
 
 from memory_thread.models.events import Event, EntityState
 from memory_thread.services.snapshot_service import SnapshotService
 from memory_thread.services.replay_service import ReplayService
-from memory_thread.services.tms_service import TMSService
 from memory_thread.db.postgres_client import PostgresClient
 from memory_thread.utils.logger import get_logger
 
@@ -15,121 +14,94 @@ log = get_logger(__name__)
 class TimewarpEngine:
     def __init__(self):
         self.snapshot_service = SnapshotService()
-        self.replay_service = ReplayService()
         self.pg = PostgresClient()
-        self.tms = TMSService()
 
-    def insert_late_event(self, event: Event) -> Dict[str, Any]:
+    def insert_late_event(self, event: Event, save_mismatch_path: Optional[str] = None) -> Dict[str, Any]:
         """
-        Inserts a late event and repairs the timeline.
-        1. Insert event into DB (Chronological/Append log).
-        2. Identify affected entities.
-        3. Recompute state from T(event).
+        Insert a late event, recompute canonical state via ReplayService, persist entity_state, save snapshot.
+        Returns dict with status and debug info.
         """
-        # 1. Insert (Log it)
-        # Note: 'timestamp' is the semantic time. 'created_at' (if exists) is system time.
-        # We trust the event's timestamp.
-        with self.pg.get_cursor() as cur:
-             cur.execute("""
-                INSERT INTO events (id, namespace, timestamp, actor, action, object_id, delta, antecedents, truth_vector)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                str(event.id), event.namespace, event.timestamp,
-                event.actor.value, event.action.value, str(event.object_id),
-                json.dumps(event.delta),
-                [str(uid) for uid in event.antecedents],
-                event.truth_vector.model_dump_json()
-            ))
-
-        # 2. Recompute State
-        # We use the ReplayService to "Replay" from the past.
-        # But wait, ReplayService in snapshot_service.py was defined inside it/merged?
-        # I defined a separate ReplayService in `replay_service.py` (Phase 6.1).
-        # And another one inside `snapshot_service.py` (Phase 6.2 plan snippet)?
-        # I overwrote `snapshot_service.py` but DID NOT include `ReplayService` class inside it in the final overwrite.
-        # I should use `memory_thread.services.replay_service.ReplayService` but it needs modification to use snapshots.
-
-        # Actually, `ReplayService` (6.1) was for debugging (Trace -> Replay).
-        # We need a `StateReconstructionService` that uses snapshots + DB events.
-
-        # Let's implement the logic here directly or helper.
-
-        new_state = self._recompute_state(event.object_id)
-
-        # 3. Update State in DB
-        # Check for conflicts? (If new state differs significantly from old, maybe flag).
-        # For now, just overwrite "Current State".
-
+        rs = ReplayService()
+        # 1) Insert late event into events table
+        # Use a short transaction to insert then commit so replay can see it
         with self.pg.get_cursor() as cur:
             cur.execute("""
-                UPDATE entity_state
-                SET current_value = %s, truth_vector = %s, last_event_id = %s, updated_at = %s, version = version + 1
-                WHERE entity_id = %s
+                INSERT INTO events (
+                    id, namespace, timestamp, actor, action, object_id,
+                    delta, antecedents, truth_vector, provenance,
+                    gateway_seq, dedup_hash
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
-                json.dumps(new_state.current_value),
-                new_state.truth_vector.model_dump_json(),
-                str(new_state.last_event_id),
-                datetime.utcnow(),
-                str(new_state.entity_id)
+                str(event.id),
+                event.namespace,
+                event.timestamp,
+                event.actor.value if hasattr(event.actor, "value") else event.actor,
+                event.action.value if hasattr(event.action, "value") else event.action,
+                str(event.object_id),
+                json.dumps([d.model_dump() if hasattr(d, "model_dump") else d.__dict__ for d in (event.delta or [])]),
+                json.dumps([str(a) for a in (event.antecedents or [])]),
+                event.truth_vector.model_dump() if hasattr(event.truth_vector, "model_dump") else (event.truth_vector.__dict__ if event.truth_vector else None),
+                event.provenance.model_dump() if (event.provenance and hasattr(event.provenance, "model_dump")) else (event.provenance.__dict__ if event.provenance else None),
+                getattr(event, "gateway_seq", None),
+                getattr(event, "dedup_hash", None)
             ))
+            # commit is automatic after context exit if using connection pool
 
-        log.info(f"Timewarp: Repaired state for {event.object_id} after late event {event.id}")
-        return {"status": "repaired", "new_state": new_state.current_value}
+        # Acquire an advisory lock on the entity to prevent concurrent repairs / writes
+        # Using hashtext for simplicity as agreed
+        lock_sql = "SELECT pg_advisory_lock(hashtext(%s))"
+        unlock_sql = "SELECT pg_advisory_unlock(hashtext(%s))"
 
-    def _recompute_state(self, entity_id: uuid.UUID) -> EntityState:
-        """
-        Rebuilds state from scratch (or nearest snapshot) using ALL events in DB (including the new late one).
-        """
-        # 1. Get all events sorted by time
-        with self.pg.get_cursor() as cur:
-            cur.execute("""
-                SELECT id, namespace, timestamp, actor, action, object_id, delta, antecedents, truth_vector
-                FROM events
-                WHERE object_id = %s
-                ORDER BY timestamp ASC
-            """, (str(entity_id),))
-            rows = cur.fetchall()
+        try:
+            with self.pg.get_cursor() as cur:
+                cur.execute(lock_sql, (str(event.object_id),))
 
-        # 2. Replay
-        # Start from empty state
-        # (Optimization: Use snapshot service later, for now full replay for correctness)
+            # 2) Capture golden trace (now includes late event)
+            trace = rs.capture_trace(event.object_id)
 
-        if not rows:
-            return None
+            # 3) Replay trace deterministically
+            ok, diffs, actual_state = rs.replay_trace(trace, save_mismatch_path=save_mismatch_path)
 
-        from memory_thread.models.events import TruthVector
-        from memory_thread.services.tms_service import StateDerivationService
+            if not ok:
+                # Save trace + diffs for triage if not done by replay_trace
+                return {"status": "replay_failed", "diffs": diffs}
 
-        # Initial State
-        first = rows[0]
-        tv_data = first['truth_vector']
-        if isinstance(tv_data, str): tv_data = json.loads(tv_data)
+            # 4) Persist repaired state and snapshot atomically
+            # Use last_event_id/timestamp from actual_state
+            # Fallback logic handled by ReplayService state derivation, but double check
+            last_evt_ts = actual_state.updated_at
+            last_evt_id = actual_state.last_event_id
+            version = getattr(actual_state, "version", None)
 
-        current_state = EntityState(
-            entity_id=entity_id,
-            namespace=first['namespace'],
-            current_value={},
-            truth_vector=TruthVector(**tv_data), # Placeholder
-            version=0,
-            last_event_id=first['id']
-        )
+            with self.pg.get_cursor() as cur:
+                cur.execute("""
+                    UPDATE entity_state
+                    SET current_value = %s, truth_vector = %s, last_event_id = %s, updated_at = %s, version = %s
+                    WHERE entity_id = %s
+                """, (
+                    json.dumps(actual_state.current_value),
+                    actual_state.truth_vector.model_dump() if hasattr(actual_state.truth_vector, "model_dump") else actual_state.truth_vector.__dict__,
+                    str(last_evt_id) if last_evt_id else None,
+                    last_evt_ts,
+                    version,
+                    str(actual_state.entity_id)
+                ))
 
-        for r in rows:
-            tv_data = r['truth_vector']
-            if isinstance(tv_data, str): tv_data = json.loads(tv_data)
+            # 5) Persist canonical snapshot via SnapshotService
+            try:
+                self.snapshot_service.take_snapshot(actual_state)
+            except Exception:
+                log.exception("Snapshot save failed (nonfatal)")
 
-            evt = Event(
-                id=r['id'],
-                namespace=r['namespace'],
-                timestamp=r['timestamp'],
-                actor=r['actor'],
-                action=r['action'],
-                object_id=r['object_id'],
-                delta=r['delta'],
-                antecedents=r['antecedents'] or [],
-                truth_vector=TruthVector(**tv_data)
-            )
+            # 6) Emit maintenance/orchestrator event or log
+            log.info("Timewarp repaired entity %s after late event %s", str(event.object_id), str(event.id))
 
-            current_state = StateDerivationService.apply_event(current_state, evt)
+            return {"status": "repaired", "entity": str(event.object_id), "new_version": version}
 
-        return current_state
+        finally:
+            # release advisory lock
+            try:
+                with self.pg.get_cursor() as cur:
+                    cur.execute(unlock_sql, (str(event.object_id),))
+            except Exception:
+                log.exception("Failed to release advisory lock for entity %s", str(event.object_id))
